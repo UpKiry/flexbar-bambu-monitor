@@ -1,9 +1,0 @@
-# Python 3.12 prototype dependencies; not a production runtime lockfile.
-# paho 1.x matches the callback signatures used by the pinned upstream revision.
-requests==2.34.2
-paho-mqtt==1.6.1
-beautifulsoup4==4.15.0
-Pillow==12.3.0
-python-dateutil==2.9.0.post0
-# Pure Python fallback for environments where charset-normalizer's native extension cannot load.
-chardet==5.2.0

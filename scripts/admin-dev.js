@@ -13,8 +13,6 @@ const path = require("node:path");
 const { createPluginRuntime } = require("../src/runtime");
 const { createCredentialStore, createMemoryBackend } = require("../src/auth/credential-store");
 const { createAdminServer } = require("../src/admin/server");
-const { createPrinterManager } = require("../src/printer/printer-manager");
-const { createPyBambuMonitorClient } = require("../src/pybambu/monitor-client");
 
 const pluginDirectory = path.join(__dirname, "..", "com.upkiry.bambumonitor.plugin");
 
@@ -40,21 +38,6 @@ function createDevPlugin() {
   };
 }
 
-function devMonitorFactory(argv) {
-  const prefix = "--pybambu-python=";
-  const selected = argv.filter((item) => item.startsWith(prefix));
-  if (!selected.length) return undefined;
-  if (selected.length !== 1 || !path.isAbsolute(selected[0].slice(prefix.length))) {
-    throw new Error("--pybambu-python 必须指定一个 Python 绝对路径");
-  }
-  const pythonCommand = selected[0].slice(prefix.length);
-  const scriptPath = path.resolve(__dirname, "pybambu_monitor.py");
-  return (options) => createPrinterManager({
-    ...options,
-    createMqttClient: (clientOptions) => createPyBambuMonitorClient({ ...clientOptions, pythonCommand, scriptPath }),
-  });
-}
-
 async function main() {
   const logger = {
     debug: (message) => console.debug(message),
@@ -69,9 +52,7 @@ async function main() {
   const credentialStore = createCredentialStore({ backend });
 
   const plugin = createDevPlugin();
-  const createMqttManager = devMonitorFactory(process.argv.slice(2));
-  if (createMqttManager) console.info("已选择实验性 Python 被动监控；设备可能不会主动提供完整状态。");
-  const runtime = createPluginRuntime({ plugin, logger, credentialStore, createMqttManager });
+  const runtime = createPluginRuntime({ plugin, logger, credentialStore });
   const admin = createAdminServer({
     runtime,
     staticDir: path.join(pluginDirectory, "resources", "admin"),
@@ -106,9 +87,9 @@ async function main() {
 
 if (require.main === module) {
   main().catch(() => {
-    console.error("开发后台启动失败，请检查 Python 路径与依赖");
+    console.error("开发后台启动失败");
     process.exit(1);
   });
 }
 
-module.exports = { createDevPlugin, devMonitorFactory };
+module.exports = { createDevPlugin };

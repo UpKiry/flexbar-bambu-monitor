@@ -41,7 +41,7 @@ npm run plugin:install
 
 `plugin:pack` 会在插件目录旁生成包；`plugin:install` 使用 `--force`，会覆盖同一插件 ID 的已安装版本。开发时可使用 `npm run dev`。不启动 FlexDesigner 时，`npm run admin:dev` 在图形桌面会话中自动打开独立后台，配置和登录状态只保存在内存中。
 
-正式插件使用 Node.js 云 HTTP/MQTT 路径，不依赖 Python。[pybambu 后端迁移方案](docs/pybambu后端迁移方案.md) 描述了可选的实验性 Python 被动监控、开发依赖及已知限制；它尚未作为正式插件后端或独立发行包验证。
+正式插件使用 Node.js 云 HTTP/MQTT 路径，不依赖 Python。
 
 ## 验证状态
 
@@ -49,6 +49,6 @@ npm run plugin:install
 
 ## 许可证与致谢
 
-本项目采用 [MIT License](LICENSE)。实验性后端包含固定的 [ha-bambulab](https://github.com/greghesp/ha-bambulab) pybambu 源码快照，其版权与 MIT 许可见 [上游许可证](vendor/ha-bambulab/LICENSE)；来源和版本见 [UPSTREAM.json](vendor/ha-bambulab/UPSTREAM.json)。
+本项目采用 [MIT License](LICENSE)。
 
 本项目与 Bambu Lab 和 Flexbar 官方无关联。云端接口和设备字段可能随服务、机型或固件变化。
