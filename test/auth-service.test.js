@@ -265,3 +265,138 @@ test("China phone numbers are normalized before requesting a code", async () => 
   assert.equal(result.status, "code-sent");
   assert.equal(sent, "+8613800138000");
 });
+
+
+test("password verification keeps the normalized account and permits a retry", async () => {
+  const attempts = [];
+  const { auth } = setup({
+    region: "china",
+    login: async (credentials) => {
+      attempts.push(credentials);
+      if (credentials.password) throw new CloudApiError(ERROR_KINDS.verificationRequired, "需要验证码");
+      if (credentials.code === "wrong") throw new CloudApiError(ERROR_KINDS.verificationInvalid, "验证码错误");
+      return { accessToken: "tok", expiresInSeconds: 60 };
+    },
+  });
+  assert.equal((await auth.loginWithPassword({ region: "china", account: "+86 138-0013-8000", password: "pw" })).status, "code-required");
+  assert.equal((await auth.submitCode({ code: "" })).status, "failed");
+  assert.equal((await auth.submitCode({ code: "wrong" })).status, "failed");
+  assert.equal((await auth.submitCode({ code: "right" })).status, "success");
+  assert.deepEqual(attempts.slice(1), [
+    { account: "+8613800138000", code: "wrong" },
+    { account: "+8613800138000", code: "right" },
+  ]);
+  assert.equal((await auth.submitCode({ code: "again" })).status, "failed");
+});
+
+test("transient code errors retain the flow, but terminal errors clear it", async () => {
+  let kind = ERROR_KINDS.network;
+  const { auth } = setup({ login: async () => { throw new CloudApiError(kind, "失败"); } });
+  await auth.requestEmailCode({ region: "global", account: "a@b.c" });
+  assert.equal((await auth.submitCode({ code: "123" })).error.kind, ERROR_KINDS.network);
+  kind = ERROR_KINDS.twoFactorRequired;
+  assert.equal((await auth.submitCode({ code: "123" })).status, "unsupported");
+  assert.match((await auth.submitCode({ code: "123" })).error.message, /流程已失效/);
+});
+
+test("cancel, logout, invalidate and switching login clear pending verification", async () => {
+  for (const action of [
+    (auth) => auth.cancelPendingLogin(),
+    (auth) => auth.logout(),
+    (auth) => auth.invalidate(),
+    (auth) => auth.loginWithPassword({ region: "china", account: "bad@email", password: "pw" }),
+    (auth) => auth.requestEmailCode({ region: "global", account: "" }),
+  ]) {
+    const { auth } = setup();
+    await auth.requestEmailCode({ region: "global", account: "a@b.c" });
+    await action(auth);
+    assert.match((await auth.submitCode({ code: "123" })).error.message, /流程已失效/);
+  }
+});
+
+test("cancelled in-flight requests cannot restore a verification flow or session", async () => {
+  let resolveRequest;
+  const { auth } = setup({ requestEmailCode: () => new Promise((resolve) => { resolveRequest = resolve; }) });
+  const request = auth.requestEmailCode({ region: "global", account: "a@b.c" });
+  assert.equal(auth.cancelPendingLogin().state, STATES.signedOut);
+  resolveRequest({ codeSent: true });
+  assert.equal((await request).status, "cancelled");
+  assert.match((await auth.submitCode({ code: "123" })).error.message, /流程已失效/);
+
+  let resolveUser;
+  const second = setup({ fetchUserId: () => new Promise((resolve) => { resolveUser = resolve; }) });
+  const login = second.auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await second.auth.logout();
+  resolveUser("42");
+  assert.equal((await login).status, "cancelled");
+  assert.equal(second.auth.getAccessToken(), null);
+  assert.equal(await second.store.load(), null);
+});
+
+
+test("logout waits for an in-progress credential save before clearing it", async () => {
+  let finishSave;
+  let stored = null;
+  const store = {
+    save: (value) => new Promise((resolve) => { finishSave = () => { stored = value; resolve({ persisted: true }); }; }),
+    clear: async () => { stored = null; },
+    load: async () => stored,
+  };
+  const auth = createAuthService({ createApi: () => makeApi(), credentialStore: store, logger: {} });
+  const login = auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const logout = auth.logout();
+  finishSave();
+  assert.equal((await login).status, "cancelled");
+  assert.equal((await logout).state, STATES.signedOut);
+  assert.equal(await store.load(), null);
+  assert.equal(auth.snapshot().persisted, false);
+});
+
+
+test("cancelling during credential save discards the new session and stored credentials", async () => {
+  let finishSave;
+  let stored = null;
+  const store = {
+    save: (value) => new Promise((resolve) => { finishSave = () => { stored = value; resolve({ persisted: true }); }; }),
+    clear: async () => { stored = null; },
+    load: async () => stored,
+  };
+  const auth = createAuthService({ createApi: () => makeApi(), credentialStore: store, logger: {} });
+  const login = auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(auth.getAccessToken(), null);
+  assert.equal(auth.cancelPendingLogin().state, STATES.signedOut);
+  finishSave();
+  assert.equal((await login).status, "cancelled");
+  assert.equal(auth.getAccessToken(), null);
+  assert.equal(auth.snapshot().persisted, false);
+  assert.equal(await store.load(), null);
+});
+
+test("cancelling a replacement login during save restores the previous credentials", async () => {
+  const original = JSON.stringify({ session: { accessToken: "old", region: "global" } });
+  let stored = original;
+  let finishSave;
+  let saves = 0;
+  const store = {
+    save: (value) => {
+      saves += 1;
+      if (saves === 1) return new Promise((resolve) => { finishSave = () => { stored = value; resolve({ persisted: true }); }; });
+      stored = value;
+      return Promise.resolve({ persisted: true });
+    },
+    clear: async () => { stored = null; },
+    load: async () => stored,
+  };
+  const auth = createAuthService({ createApi: () => makeApi(), credentialStore: store, logger: {} });
+  await auth.hydrate();
+  const login = auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(auth.cancelPendingLogin().state, STATES.signedIn);
+  finishSave();
+  assert.equal((await login).status, "cancelled");
+  assert.equal(auth.getAccessToken(), "old");
+  assert.equal(JSON.parse(await store.load()).session.accessToken, "old");
+});

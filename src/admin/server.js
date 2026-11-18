@@ -35,6 +35,7 @@ const STATIC_FILES = new Map([
 const ACTIONS = new Set([
   "login",
   "requestCode",
+  "cancelCode",
   "logout",
   "refreshDevices",
   "setPrinter",

@@ -220,4 +220,100 @@ test("publish failures are reported instead of thrown", () => {
   const result = client.requestFullState();
   assert.equal(result.sent, false);
   assert.match(result.reason, /publish exploded/);
+  fake.publish = () => {};
+  assert.equal(client.requestFullState().sent, true);
+});
+
+test("connection becomes ready only after subscription is acknowledged", () => {
+  const { client, created, statuses } = makeClient();
+  client.start();
+  let complete;
+  created[0].subscribe = (topic, options, callback) => { complete = callback; };
+  created[0].emit("connect");
+  assert.equal(client.state, CONNECTION_STATES.connecting);
+  assert.equal(client.subscribed, false);
+  assert.equal(client.requestFullState().reason, "not-connected");
+  complete(null, [{ topic: reportTopic("DEV1"), qos: 0 }]);
+  assert.equal(client.state, CONNECTION_STATES.connected);
+  assert.ok(statuses.filter((status) => status.state === CONNECTION_STATES.connected).every((status) => status.subscribed));
+  client.stop();
+});
+
+test("subscription errors, rejected grants, and throws schedule reconnect", () => {
+  for (const outcome of ["error", "rejected", "throw"]) {
+    const { client, created, statuses } = makeClient();
+    client.start();
+    const fake = created[0];
+    fake.subscribe = (topic, options, callback) => {
+      if (outcome === "throw") throw new Error("subscribe failed");
+      if (outcome === "error") callback(new Error("subscribe failed"));
+      else callback(null, [{ topic, qos: 128 }]);
+    };
+    fake.emit("connect");
+    assert.equal(fake.ended, true, outcome);
+    assert.equal(client.state, CONNECTION_STATES.reconnecting, outcome);
+    assert.equal(client.subscribed, false, outcome);
+    assert.equal(client.status().lastError.kind, "network", outcome);
+    assert.ok(statuses.some((status) => status.reason === "subscribe-failed"));
+    client.stop();
+  }
+});
+
+test("late callbacks from a stopped or replaced connection have no effect", () => {
+  const { client, created, reports } = makeClient();
+  client.start();
+  const old = created[0];
+  let complete;
+  old.subscribe = (topic, options, callback) => { complete = callback; };
+  old.emit("connect");
+  const oldClose = old.listeners("close")[0];
+  const oldError = old.listeners("error")[0];
+  const oldMessage = old.listeners("message")[0];
+  client.stop();
+  client.start();
+  created[1].emit("connect");
+  complete(null);
+  oldClose();
+  oldError({ code: 5 });
+  oldMessage(reportTopic("DEV1"), Buffer.from(JSON.stringify({ print: { gcode_state: "RUNNING" } })));
+  assert.equal(client.state, CONNECTION_STATES.connected);
+  assert.equal(client.subscribed, true);
+  assert.equal(reports.length, 0);
+  assert.equal(created[1].ended, false);
+  client.stop();
+});
+
+test("failed publish restores the previous cooldown, including asynchronous errors", () => {
+  let clock = 0;
+  const { client, created } = makeClient({ now: () => clock, pushallCooldownMs: 1000 });
+  client.start();
+  const fake = created[0];
+  fake.emit("connect");
+  assert.equal(client.requestFullState().sent, true);
+  clock = 500;
+  fake.publish = () => { throw new Error("failed"); };
+  assert.equal(client.requestFullState({ force: true }).sent, false);
+  assert.deepEqual(client.requestFullState(), { sent: false, reason: "cooldown", retryInMs: 500 });
+  clock = 1000;
+  let callback;
+  fake.publish = (topic, payload, options, done) => { callback = done; };
+  assert.equal(client.requestFullState().sent, true);
+  callback(new Error("asynchronous failure"));
+  assert.equal(client.requestFullState().sent, true);
+  client.stop();
+});
+
+test("old publish failure cannot erase a newer request cooldown", () => {
+  let clock = 0;
+  const { client, created } = makeClient({ now: () => clock, pushallCooldownMs: 1000 });
+  client.start();
+  created[0].emit("connect");
+  const callbacks = [];
+  created[0].publish = (topic, payload, options, callback) => callbacks.push(callback);
+  assert.equal(client.requestFullState().sent, true);
+  clock = 100;
+  assert.equal(client.requestFullState({ force: true }).sent, true);
+  callbacks[0](new Error("late failure"));
+  assert.equal(client.requestFullState().reason, "cooldown");
+  client.stop();
 });

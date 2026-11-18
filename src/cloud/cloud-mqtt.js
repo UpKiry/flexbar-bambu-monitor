@@ -88,6 +88,7 @@ function createCloudMqttClient({
   let reconnectTimer = null;
   // null 表示从未请求过：用 0 会在时钟从 0 开始的测试里被误判成"冷却中"。
   let lastPushallAt = null;
+  let pushallSequence = 0;
   let lastError = null;
   let reportHandler = null;
   let statusHandler = null;
@@ -206,29 +207,40 @@ function createCloudMqttClient({
     client = next;
 
     next.on("connect", () => {
-      attempt = 0;
-      lastError = null;
-      setState(CONNECTION_STATES.connected);
+      if (client !== next || stopped) return;
       const topic = reportTopic(deviceId);
+      let settled = false;
+      const onSubscribed = (error, granted) => {
+        if (settled || client !== next || stopped) return;
+        settled = true;
+        const rejected = granted?.some((entry) => entry.qos >= 128);
+        if (error || rejected) {
+          const message = error?.message || "云端拒绝订阅";
+          lastError = { kind: "network", message };
+          logger?.warn?.(`订阅云端状态失败：${message}`);
+          teardownClient();
+          scheduleReconnect("subscribe-failed");
+          return;
+        }
+        subscribed = true;
+        attempt = 0;
+        lastError = null;
+        setState(CONNECTION_STATES.connected);
+        logger?.info?.(`已连接云端并订阅 ${topic}`);
+      };
       try {
-        next.subscribe(topic, { qos: 0 }, (error) => {
-          if (error) {
-            lastError = { kind: "network", message: error?.message || "订阅失败" };
-            logger?.warn?.(`订阅云端状态失败：${error?.message || error}`);
-            return;
-          }
-          subscribed = true;
-          emitStatus();
-          logger?.info?.(`已连接云端并订阅 ${topic}`);
-        });
+        next.subscribe(topic, { qos: 0 }, onSubscribed);
       } catch (error) {
-        logger?.warn?.(`订阅云端状态失败：${error?.message || error}`);
+        onSubscribed(error);
       }
     });
 
-    next.on("message", handleMessage);
+    next.on("message", (topic, payload) => {
+      if (client === next && !stopped) handleMessage(topic, payload);
+    });
 
     next.on("error", (error) => {
+      if (client !== next || stopped) return;
       const code = error?.code;
       lastError = { kind: code === MQTT_ERRORS.notAuthorized ? "unauthorized" : "network", message: error?.message || "云连接错误" };
       if (code === MQTT_ERRORS.notAuthorized || code === MQTT_ERRORS.unauthorized) {
@@ -238,9 +250,8 @@ function createCloudMqttClient({
     });
 
     next.on("close", () => {
-      client = null;
-      subscribed = false;
-      if (stopped) return;
+      if (client !== next || stopped) return;
+      teardownClient();
       if (state === CONNECTION_STATES.failed) return;
       scheduleReconnect("connection-closed");
     });
@@ -295,15 +306,26 @@ function createCloudMqttClient({
       if (!force && lastPushallAt !== null && stamp - lastPushallAt < pushallCooldownMs) {
         return { sent: false, reason: "cooldown", retryInMs: pushallCooldownMs - (stamp - lastPushallAt) };
       }
+      const previousPushallAt = lastPushallAt;
+      const sequence = ++pushallSequence;
       lastPushallAt = stamp;
+      let publishError = null;
+      function failed(error) {
+        if (!error) return;
+        publishError = error;
+        if (pushallSequence === sequence) lastPushallAt = previousPushallAt;
+      }
       try {
         client.publish(
           requestTopic(deviceId),
           JSON.stringify({ pushing: { sequence_id: "0", command: "pushall", version: 1, push_target: 1 } }),
           { qos: 1 },
+          failed,
         );
+        if (publishError) return { sent: false, reason: publishError.message || "发送失败" };
         return { sent: true, reason: null };
       } catch (error) {
+        failed(error);
         return { sent: false, reason: error?.message || "发送失败" };
       }
     },

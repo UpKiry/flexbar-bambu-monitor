@@ -33,10 +33,11 @@ function createPrinterManager({
 
   function detachClient() {
     if (!client) return;
-    client.onReport(null);
-    client.onStatus(null);
-    client.stop();
+    const previous = client;
     client = null;
+    previous.onReport(null);
+    previous.onStatus(null);
+    previous.stop();
   }
 
   function connectionStateFor(mqttState) {
@@ -93,6 +94,7 @@ function createPrinterManager({
     client = next;
 
     next.onStatus((status) => {
+      if (client !== next) return;
       lastStatus = status;
       const mapped = connectionStateFor(status.state);
       state = reduceConnection(state, mapped);
@@ -101,6 +103,7 @@ function createPrinterManager({
     });
 
     next.onReport(({ raw, receivedAt }) => {
+      if (client !== next) return;
       const { state: merged, taskSwitched, reason } = reduceReport(state, raw, { receivedAt });
       state = merged;
       notify({ type: "report", state, taskSwitched, reason });

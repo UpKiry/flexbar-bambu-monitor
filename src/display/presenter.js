@@ -66,20 +66,19 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
     return { tone: TONES.muted, title: "等待打印机状态", subtitle: "", icon: "clock", stale: true };
   }
 
-  const ageMs = Math.max(0, now - state.lastReportAt);
   const stale = linkState !== "connected";
   const activity = state.activity || "unknown";
+  if (stale) {
+    return {
+      tone: TONES.warning,
+      title: "数据已过期",
+      subtitle: "云端连接中断，显示最后已知状态",
+      icon: "cloud-off",
+      stale: true,
+    };
+  }
 
   if (activity === "printing") {
-    if (stale) {
-      return {
-        tone: TONES.warning,
-        title: "数据已过期",
-        subtitle: "云端连接中断，显示最后已知状态",
-        icon: "cloud-off",
-        stale: true,
-      };
-    }
     return {
       tone: TONES.normal,
       title: "打印中",

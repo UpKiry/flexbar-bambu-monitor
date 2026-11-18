@@ -20,6 +20,7 @@ function makeFakeMqttFactory() {
       requestFullState: () => ({ sent: true }),
       emitStatus(status) { statusHandler.fn?.(status); },
       emitReport(report) { reportHandler.fn?.(report); },
+      captureHandlers() { return { status: statusHandler.fn, report: reportHandler.fn }; },
     };
     created.push(instance);
     return instance;
@@ -170,4 +171,22 @@ test("requestFullState is forwarded to the live client only", () => {
   manager.selectPrinter("DEV1");
   manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
   assert.deepEqual(manager.requestFullState(), { sent: true });
+});
+
+test("callbacks retained by an old client cannot change a new printer", () => {
+  const { manager, created } = setup();
+  const changes = [];
+  manager.subscribe((change) => changes.push(change));
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  const old = created[0].captureHandlers();
+  manager.selectPrinter("DEV2");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  const before = changes.length;
+  old.status({ state: CONNECTION_STATES.connected, subscribed: true });
+  old.report({ raw: { gcode_state: "RUNNING", mc_percent: 90 }, receivedAt: 10 });
+  assert.equal(changes.length, before);
+  assert.equal(manager.connected, false);
+  assert.equal(manager.state.progressPercent, null);
+  assert.equal(manager.printerId, "DEV2");
 });

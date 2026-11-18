@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { CloudApi, CloudApiError, ERROR_KINDS, classifyServiceError } = require("../src/cloud/cloud-api");
+const { EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
+const { CloudApi, CloudApiError, ERROR_KINDS, classifyServiceError, request } = require("../src/cloud/cloud-api");
 
 /** 构造一个记录请求并可返回预设响应的假 HTTPS 层。 */
 function makeRequester(responses) {
@@ -199,4 +201,109 @@ test("code login submits only account and code", async () => {
   const api = new CloudApi({ region: "china", requestFn: requester.fn });
   await api.login({ account: "13800138000", code: "123456" });
   assert.deepEqual(requester.calls[0].body, { account: "13800138000", code: "123456" });
+});
+
+// 保留真实请求封装和可读流，只控制 HTTPS 事件及字节传输。
+function controlledTransport() {
+  const req = new EventEmitter();
+  req.write = () => {};
+  req.end = () => {};
+  req.destroy = () => { req.destroyed = true; };
+  const res = new PassThrough();
+  res.statusCode = 200;
+  res.headers = {};
+  let respond;
+  let options;
+  return {
+    req,
+    res,
+    get options() { return options; },
+    requestFn: (requestOptions, callback) => {
+      options = requestOptions;
+      respond = callback;
+      return req;
+    },
+    respond: () => respond(res),
+  };
+}
+
+function transportRequest(transport, timeoutMs = 1000) {
+  return request({ url: "https://example.test/path", timeoutMs, httpsRequest: transport.requestFn });
+}
+
+function rejectsKind(promise, kind) {
+  return assert.rejects(promise, (error) => error instanceof CloudApiError && error.kind === kind);
+}
+
+test("transport accepts a complete response at the 1 MiB boundary", async () => {
+  const transport = controlledTransport();
+  const pending = transportRequest(transport);
+  assert.equal(transport.options.rejectUnauthorized, undefined);
+  transport.respond();
+  transport.res.end(Buffer.alloc(1024 * 1024, 97));
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.equal(Buffer.byteLength(response.text), 1024 * 1024);
+});
+
+test("transport rejects more than 1 MiB across chunks and destroys the request", async () => {
+  const transport = controlledTransport();
+  const pending = transportRequest(transport);
+  transport.respond();
+  transport.res.write(Buffer.alloc(1024 * 1024));
+  transport.res.write(Buffer.alloc(1));
+  await rejectsKind(pending, ERROR_KINDS.network);
+  assert.equal(transport.req.destroyed, true);
+  assert.equal(transport.res.destroyed, true);
+});
+
+test("transport maps aborted, errored and prematurely closed responses", async (t) => {
+  for (const event of ["aborted", "error", "close"]) {
+    await t.test(event, async () => {
+      const transport = controlledTransport();
+      const pending = transportRequest(transport);
+      transport.respond();
+      transport.res.write("partial");
+      transport.res.emit(event, ...(event === "error" ? [new Error("stream failure")] : []));
+      await rejectsKind(pending, ERROR_KINDS.network);
+      assert.equal(transport.req.destroyed, true);
+    });
+  }
+});
+
+test("transport maps request errors and socket timeout", async (t) => {
+  for (const [event, error, kind] of [
+    ["error", Object.assign(new Error("reset"), { code: "ECONNRESET" }), ERROR_KINDS.network],
+    ["error", Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }), ERROR_KINDS.timeout],
+    ["timeout", undefined, ERROR_KINDS.timeout],
+  ]) {
+    await t.test(`${event} ${kind}`, async () => {
+      const transport = controlledTransport();
+      const pending = transportRequest(transport);
+      transport.req.emit(event, error);
+      await rejectsKind(pending, kind);
+      assert.equal(transport.req.destroyed, true);
+    });
+  }
+});
+
+test("total deadline applies before headers and while data keeps arriving", async (t) => {
+  await t.test("before headers", async () => {
+    const transport = controlledTransport();
+    await rejectsKind(transportRequest(transport, 40), ERROR_KINDS.timeout);
+    assert.equal(transport.req.destroyed, true);
+  });
+  await t.test("while receiving data", async () => {
+    const transport = controlledTransport();
+    const pending = transportRequest(transport, 80);
+    transport.respond();
+    const interval = setInterval(() => transport.res.write("x"), 10);
+    try {
+      await rejectsKind(pending, ERROR_KINDS.timeout);
+      assert.equal(transport.req.destroyed, true);
+      assert.equal(transport.res.destroyed, true);
+    } finally {
+      clearInterval(interval);
+    }
+  });
 });

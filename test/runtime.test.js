@@ -243,6 +243,16 @@ test("verification code login goes through requestCode then login", async () => 
   assert.equal(loginCalls, 1);
 });
 
+test("cancelling a verification flow prevents later code submission", async () => {
+  const { runtime } = makeRuntime();
+  await runtime.start();
+  assert.equal((await runtime.actions.requestCode({ account: "a@b.c" })).status, "code-sent");
+  assert.equal((await runtime.actions.cancelCode()).status, "success");
+  const result = await runtime.actions.login({ code: "123456" });
+  assert.equal(result.status, "failed");
+  assert.match(result.message, /验证码流程已失效/);
+});
+
 test("clicking a monitor key cycles its view", async () => {
   const { runtime, host } = makeRuntime();
   await runtime.start();
@@ -442,4 +452,43 @@ test("requestCode that logs in directly also refreshes devices and starts monito
   assert.equal(runtime.config.printerId, "DEV1");
   assert.equal(mqtt.length, 1);
   assert.equal(mqtt[0].options.deviceId, "DEV1");
+});
+
+test("failed configuration writes do not change runtime or active monitor", async () => {
+  const host = makePlugin();
+  const { runtime, mqtt } = makeRuntime({ plugin: host });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  host.setConfig = async () => { throw new Error("write failed"); };
+  assert.equal((await runtime.actions.setPrinter({ printerId: "OTHER" })).status, "error");
+  assert.equal((await runtime.actions.setRegion({ region: "china" })).status, "error");
+  assert.equal(runtime.config.printerId, "DEV1");
+  assert.equal(runtime.config.region, "global");
+  assert.equal(runtime.auth.state, "signed-in");
+  assert.equal(mqtt[0].stopped, false);
+});
+
+test("configuration changes are saved and applied in request order", async () => {
+  const host = makePlugin();
+  const originalSet = host.setConfig;
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  let writes = 0;
+  host.setConfig = async (next) => {
+    writes += 1;
+    if (writes === 1) await blocked;
+    return originalSet(next);
+  };
+  const { runtime } = makeRuntime({ plugin: host });
+  await runtime.start();
+  const first = runtime.actions.setPrinter({ printerId: "A" });
+  const second = runtime.actions.setRegion({ region: "china" });
+  await Promise.resolve();
+  assert.equal(writes, 1);
+  release();
+  assert.equal((await first).status, "success");
+  assert.equal((await second).status, "success");
+  assert.equal(runtime.config.printerId, "A");
+  assert.equal(runtime.config.region, "china");
+  assert.deepEqual(host.savedConfigs.at(-1), runtime.config);
 });

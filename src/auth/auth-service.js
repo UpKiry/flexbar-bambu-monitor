@@ -58,6 +58,8 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
   let pendingAccount = null;
   let pendingApi = null;
   let inFlight = false;
+  let loginGeneration = 0;
+  let pendingPersist = null;
 
   function snapshot() {
     return {
@@ -81,6 +83,18 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
   function clearSecrets() {
     pendingAccount = null;
     pendingApi = null;
+  }
+
+  /** 取消当前登录流程，并忽略尚未完成的认证响应。 */
+  function cancelPendingLogin() {
+    loginGeneration += 1;
+    clearSecrets();
+    if (state === STATES.signingIn || state === STATES.awaitingCode || state === STATES.awaitingTwoFactor || state === STATES.failed) {
+      state = session.accessToken ? STATES.signedIn : STATES.signedOut;
+      if (session.accessToken) regionId = session.region;
+      lastError = null;
+    }
+    return snapshot();
   }
 
   function apiFor(region) {
@@ -113,14 +127,35 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
     return at >= session.expiresAt;
   }
 
-  async function persist() {
-    const record = { [TOKEN_KEY]: session };
-    const result = await credentialStore.save(JSON.stringify(record));
-    sessionPersisted = result?.persisted === true;
-    if (!sessionPersisted) {
-      logger?.warn?.("安全存储不可用，登录状态仅保留在内存中，重启后需重新登录");
+  async function persist(nextSession, generation, api) {
+    const previousRecord = sessionPersisted ? JSON.stringify({ [TOKEN_KEY]: session }) : null;
+    const operation = (async () => {
+      const result = await credentialStore.save(JSON.stringify({ [TOKEN_KEY]: nextSession }));
+      if (generation !== loginGeneration) {
+        if (result?.persisted === true) {
+          if (previousRecord) await credentialStore.save(previousRecord);
+          else await credentialStore.clear();
+        }
+        return false;
+      }
+      session = nextSession;
+      sessionPersisted = result?.persisted === true;
+      if (!sessionPersisted) {
+        logger?.warn?.("安全存储不可用，登录状态仅保留在内存中，重启后需重新登录");
+      }
+      state = STATES.signedIn;
+      lastError = null;
+      regionId = api.regionId;
+      clearSecrets();
+      logger?.info?.(`Bambu 账号登录成功（区域：${api.regionLabel || api.regionId}）`);
+      return true;
+    })();
+    pendingPersist = operation;
+    try {
+      return await operation;
+    } finally {
+      if (pendingPersist === operation) pendingPersist = null;
     }
-    return sessionPersisted;
   }
 
   async function hydrate() {
@@ -159,24 +194,27 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
    */
   async function loginWithPassword({ region, account, password }) {
     if (inFlight) return { status: "busy", ...snapshot() };
+    clearSecrets();
     if (!account || !password) return fail(ERROR_KINDS.invalidCredentials, "请填写账号和密码");
     const resolved = resolveRegion(region);
     const normalizedAccount = normalizeAccount(resolved.id, account);
     const kindError = accountKindError(resolved.id, normalizedAccount);
     if (kindError) return fail(ERROR_KINDS.invalidCredentials, kindError);
     inFlight = true;
+    const generation = ++loginGeneration;
     regionId = resolved.id;
     state = STATES.signingIn;
     lastError = null;
     const api = apiFor(regionId);
     try {
       const result = await api.login({ account: normalizedAccount, password });
-      await completeLogin(api, result);
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
+      if (!await completeLogin(api, result, generation)) return { status: "cancelled", ...snapshot() };
       return { status: "success", ...snapshot() };
     } catch (error) {
-      return handleAuthError(error, { account, api });
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
+      return handleAuthError(error, { account: normalizedAccount, api });
     } finally {
-      clearSecrets();
       inFlight = false;
     }
   }
@@ -184,18 +222,21 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
   /** 请求验证码：邮箱账号发邮件，手机号账号发短信。 */
   async function requestEmailCode({ region, account }) {
     if (inFlight) return { status: "busy", ...snapshot() };
+    clearSecrets();
     if (!account) return fail(ERROR_KINDS.invalidCredentials, "请填写账号");
     const resolved = resolveRegion(region);
     const normalizedAccount = normalizeAccount(resolved.id, account);
     const kindError = accountKindError(resolved.id, normalizedAccount);
     if (kindError) return fail(ERROR_KINDS.invalidCredentials, kindError);
     inFlight = true;
+    const generation = ++loginGeneration;
     regionId = resolved.id;
     state = STATES.signingIn;
     lastError = null;
     const api = apiFor(regionId);
     try {
       const result = await api.requestEmailCode(normalizedAccount);
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
       if (result.codeSent) {
         pendingAccount = normalizedAccount;
         pendingApi = api;
@@ -203,10 +244,11 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
         const channelLabel = result.channel === "sms" ? "手机号" : "邮箱";
         return { status: "code-sent", message: `验证码已发送至账号${channelLabel}`, channel: result.channel || "email", ...snapshot() };
       }
-      await completeLogin(api, result.login);
+      if (!await completeLogin(api, result.login, generation)) return { status: "cancelled", ...snapshot() };
       return { status: "success", ...snapshot() };
     } catch (error) {
-      return handleAuthError(error, { account, api });
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
+      return handleAuthError(error, { account: normalizedAccount, api });
     } finally {
       inFlight = false;
     }
@@ -220,20 +262,25 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       return fail(ERROR_KINDS.verificationInvalid, "验证码流程已失效，请重新登录");
     }
     inFlight = true;
+    const generation = ++loginGeneration;
+    const account = pendingAccount;
+    const api = pendingApi;
     state = STATES.signingIn;
+    lastError = null;
     try {
-      const result = await pendingApi.login({ account: pendingAccount, code });
-      await completeLogin(pendingApi, result);
+      const result = await api.login({ account, code });
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
+      if (!await completeLogin(api, result, generation)) return { status: "cancelled", ...snapshot() };
       return { status: "success", ...snapshot() };
     } catch (error) {
-      return handleAuthError(error, { account: pendingAccount, api: pendingApi });
+      if (generation !== loginGeneration) return { status: "cancelled", ...snapshot() };
+      return handleAuthError(error, { account, api, retryCode: true });
     } finally {
-      clearSecrets();
       inFlight = false;
     }
   }
 
-  async function completeLogin(api, loginResult) {
+  async function completeLogin(api, loginResult, generation) {
     const issuedAt = now();
     const expiresAt = Number.isFinite(loginResult?.expiresInSeconds)
       ? issuedAt + loginResult.expiresInSeconds * 1000
@@ -245,7 +292,8 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       // 拿不到 uid 只影响云 MQTT，登录本身仍应成功。
       logger?.warn?.(`读取用户标识失败：${error?.message || error}`);
     }
-    session = {
+    if (generation !== loginGeneration) return false;
+    const nextSession = {
       accessToken: loginResult.accessToken,
       refreshToken: loginResult.refreshToken || "",
       userId,
@@ -253,16 +301,10 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       issuedAt,
       expiresAt,
     };
-    state = STATES.signedIn;
-    lastError = null;
-    regionId = api.regionId;
-    pendingAccount = null;
-    pendingApi = null;
-    await persist();
-    logger?.info?.(`Bambu 账号登录成功（区域：${api.regionLabel || api.regionId}）`);
+    return persist(nextSession, generation, api);
   }
 
-  function handleAuthError(error, { account, api }) {
+  function handleAuthError(error, { account, api, retryCode = false }) {
     clearSecrets();
     const kind = error instanceof CloudApiError ? error.kind : ERROR_KINDS.unknown;
     const message = error instanceof CloudApiError
@@ -274,6 +316,11 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       pendingApi = api;
       lastError = { kind, message };
       return { status: "code-required", ...snapshot() };
+    }
+    if (retryCode && [ERROR_KINDS.verificationInvalid, ERROR_KINDS.rateLimited, ERROR_KINDS.network, ERROR_KINDS.timeout, ERROR_KINDS.unknown].includes(kind)) {
+      pendingAccount = account;
+      pendingApi = api;
+      return fail(kind, message);
     }
     if (kind === ERROR_KINDS.twoFactorRequired) {
       state = STATES.awaitingTwoFactor;
@@ -289,6 +336,7 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
 
   /** 退出登录：关闭云端连接由上层负责，这里只清理本地凭据。 */
   async function logout({ revokeRemote = true } = {}) {
+    cancelPendingLogin();
     const token = session.accessToken;
     const api = regionId ? apiFor(regionId) : null;
     session = emptySession();
@@ -296,6 +344,7 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
     state = STATES.signedOut;
     lastError = null;
     clearSecrets();
+    if (pendingPersist) await pendingPersist.catch(() => {});
     await credentialStore.clear();
     if (revokeRemote && api && token) {
       // 服务端会话撤销是"尽力而为"：网络失败不能阻止本地退出登录。
@@ -310,10 +359,12 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
 
   /** 上层在收到 401 时调用，统一转移到"需要重新登录"。 */
   async function invalidate(reason = "登录已失效，请重新登录") {
+    cancelPendingLogin();
     session = emptySession();
     sessionPersisted = false;
     state = STATES.expired;
     lastError = { kind: ERROR_KINDS.unauthorized, message: reason };
+    if (pendingPersist) await pendingPersist.catch(() => {});
     await credentialStore.clear();
     return snapshot();
   }
@@ -340,6 +391,7 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
     loginWithPassword,
     requestEmailCode,
     submitCode,
+    cancelPendingLogin,
     logout,
     invalidate,
     isExpired,

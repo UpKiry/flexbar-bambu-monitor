@@ -74,6 +74,13 @@ function createPluginRuntime({
   let started = false;
   /** 浏览器后台控制器由入口在创建后注入，runtime 不依赖 HTTP 细节。 */
   let adminController = null;
+  // 串行化配置读取和写入，避免并发请求互相覆盖。
+  let configQueue = Promise.resolve();
+  function queueConfig(operation) {
+    const result = configQueue.then(operation);
+    configQueue = result.catch(() => {});
+    return result;
+  }
   /** uid → { key, serialNumber, view } */
   const keys = new Map();
   /** 每个按键的视图，按键点击时轮换。 */
@@ -110,7 +117,7 @@ function createPluginRuntime({
     // 只有确实收到过设备报文时，温度 / 任务视图才有意义；
     // 登录提示等前置状态仍然显示原因，而不是一片 "无数据"。
     const hasReport = printer.state?.lastReportAt !== null && printer.state?.lastReportAt !== undefined;
-    if (view && view !== "progress" && hasReport && base.icon !== "cloud-off") {
+    if (view && view !== "progress" && hasReport && printer.status?.state === "connected") {
       const details = buildViewDetails(printer.state, view);
       return { ...base, title: details.title, subtitle: details.subtitle };
     }
@@ -121,7 +128,7 @@ function createPluginRuntime({
     if (mqttState === "connected") return "connected";
     if (mqttState === "connecting") return "connecting";
     if (mqttState === "reconnecting") return "reconnecting";
-    if (mqttState === "failed") return "error";
+    if (mqttState === "failed") return "failed";
     return "idle";
   }
 
@@ -154,18 +161,19 @@ function createPluginRuntime({
     const previous = config;
     config = normalizeConfig(next);
     const printerChanged = config.printerId !== previous.printerId;
-    if (printerChanged) {
-      activeMonitor = null;
-      printer.selectPrinter(config.printerId || null, { name: config.printerName });
-      if (config.printerId) startMonitoring();
-      else printer.disconnect();
-    }
+    if (config.region !== previous.region) auth.cancelPendingLogin();
     if (config.region !== previous.region && auth.state === STATES.signedIn) {
       // 区域变更后旧令牌属于另一个服务端，必须停止监控并要求重新登录。
       activeMonitor = null;
       printer.disconnect();
       auth.invalidate("账号区域已更改，请重新登录").catch(() => {});
       renderAll({ urgent: true }).catch(() => {});
+    }
+    if (printerChanged) {
+      activeMonitor = null;
+      printer.selectPrinter(config.printerId || null, { name: config.printerName });
+      if (config.printerId) startMonitoring();
+      else printer.disconnect();
     }
   }
 
@@ -222,16 +230,18 @@ function createPluginRuntime({
   /** 登录成功后的统一收尾：刷设备、单设备自动选中、启动监控。 */
   async function finishSignIn() {
     await refreshDevices();
-    // 只有一台设备时直接选中，省掉用户一步；多设备仍由用户明确选择。
-    if (!config.printerId && devices.length === 1) {
-      const only = devices[0];
-      applyConfig({ ...config, printerId: only.id, printerName: only.name });
-      try {
-        await plugin.setConfig?.(config);
-      } catch (error) {
-        logError("保存插件配置失败", error);
+    await queueConfig(async () => {
+      if (!config.printerId && devices.length === 1) {
+        const only = devices[0];
+        const next = { ...config, printerId: only.id, printerName: only.name };
+        try {
+          await plugin.setConfig?.(next);
+          applyConfig(next);
+        } catch (error) {
+          logError("保存插件配置失败", error);
+        }
       }
-    }
+    });
     startMonitoring();
   }
 
@@ -327,7 +337,7 @@ function createPluginRuntime({
   });
 
   plugin.on("plugin.config.updated", () => {
-    loadConfig().catch((error) => logError("应用插件配置失败", error));
+    queueConfig(() => loadConfig()).catch((error) => logError("应用插件配置失败", error));
   });
 
   // ---------------------------------------------------------------------
@@ -372,6 +382,9 @@ function createPluginRuntime({
       renderAll({ urgent: true }).catch(() => {});
       return { status: result.status, message: result.error?.message || "", auth: result, devices, config };
     },
+    async cancelCode() {
+      return { status: "success", auth: auth.cancelPendingLogin() };
+    },
     async logout() {
       activeMonitor = null;
       printer.disconnect();
@@ -385,30 +398,35 @@ function createPluginRuntime({
       return refreshDevices();
     },
     async setPrinter(payload) {
-      const printerId = typeof payload?.printerId === "string" ? payload.printerId : "";
-      const device = devices.find((item) => item.id === printerId);
-      const next = { ...config, printerId, printerName: device?.name || payload?.printerName || "" };
-      applyConfig(next);
-      try {
-        await plugin.setConfig(config);
-      } catch (error) {
-        logError("保存插件配置失败", error);
-        return { status: "error", message: "保存插件配置失败" };
-      }
-      renderAll({ urgent: true }).catch(() => {});
-      return { status: "success", config };
+      return queueConfig(async () => {
+        const printerId = typeof payload?.printerId === "string" ? payload.printerId : "";
+        const device = devices.find((item) => item.id === printerId);
+        const next = { ...config, printerId, printerName: device?.name || payload?.printerName || "" };
+        try {
+          await plugin.setConfig(next);
+        } catch (error) {
+          logError("保存插件配置失败", error);
+          return { status: "error", message: "保存插件配置失败" };
+        }
+        applyConfig(next);
+        renderAll({ urgent: true }).catch(() => {});
+        return { status: "success", config };
+      });
     },
     async setRegion(payload) {
-      const region = resolveRegion(payload?.region).id;
-      if (region === config.region) return { status: "success", config };
-      applyConfig({ ...config, region });
-      try {
-        await plugin.setConfig(config);
-      } catch (error) {
-        logError("保存插件配置失败", error);
-        return { status: "error", message: "保存插件配置失败" };
-      }
-      return { status: "success", config, auth: auth.snapshot() };
+      return queueConfig(async () => {
+        const region = resolveRegion(payload?.region).id;
+        if (region === config.region) return { status: "success", config };
+        const next = { ...config, region };
+        try {
+          await plugin.setConfig(next);
+        } catch (error) {
+          logError("保存插件配置失败", error);
+          return { status: "error", message: "保存插件配置失败" };
+        }
+        applyConfig(next);
+        return { status: "success", config, auth: auth.snapshot() };
+      });
     },
     async requestFullState() {
       return printer.requestFullState();

@@ -4,6 +4,7 @@ const { URL } = require("node:url");
 const { listRegions, resolveRegion, regionMismatchHint } = require("./region");
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_USER_AGENT = "Flexbar-BambuMonitor/0.3.1";
 const OS_FAMILY = process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux";
 // 与 Bambu Studio / ha-bambulab 保持一致的客户端标识，减少被 Cloudflare 拦截的概率。
@@ -142,6 +143,7 @@ function request({
   body,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   agentOptions,
+  httpsRequest = https.request,
 }) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
@@ -161,42 +163,85 @@ function request({
       requestHeaders["content-length"] = String(payload.length);
     }
 
-    const req = https.request(
-      {
-        protocol: target.protocol,
-        hostname: target.hostname,
-        port: target.port || 443,
-        path: `${target.pathname}${target.search}`,
-        method,
-        headers: requestHeaders,
-        timeout: timeoutMs,
-        ...agentOptions,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          resolve({
-            status: res.statusCode || 0,
-            headers: res.headers,
-            text: Buffer.concat(chunks).toString("utf8"),
-          });
-        });
-      },
-    );
-
-    req.on("timeout", () => {
-      req.destroy(new CloudApiError(ERROR_KINDS.timeout, "请求超时"));
-    });
-    req.on("error", (error) => {
-      if (error instanceof CloudApiError) {
+    let req;
+    let res;
+    let settled = false;
+    let ended = false;
+    const timer = setTimeout(() => {
+      fail(new CloudApiError(ERROR_KINDS.timeout, "请求超时"));
+    }, timeoutMs);
+    function finish(error, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
         reject(error);
+        if (res) res.destroy();
+        if (req) req.destroy();
+      } else {
+        resolve(result);
+      }
+    }
+    function fail(error) {
+      const mapped = error instanceof CloudApiError
+        ? error
+        : new CloudApiError(classifyTransportError(error), error?.message || "网络错误", { cause: error });
+      finish(mapped);
+    }
+
+    try {
+      req = httpsRequest(
+        {
+          protocol: target.protocol,
+          hostname: target.hostname,
+          port: target.port || 443,
+          path: `${target.pathname}${target.search}`,
+          method,
+          headers: requestHeaders,
+          timeout: timeoutMs,
+          ...agentOptions,
+        },
+        (response) => {
+          res = response;
+          const chunks = [];
+          let bytes = 0;
+          res.on("error", fail);
+          res.on("aborted", () => fail(new Error("响应中断")));
+          res.on("close", () => {
+            if (!ended) fail(new Error("响应提前关闭"));
+          });
+          res.on("data", (chunk) => {
+            if (settled) return;
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            bytes += buffer.length;
+            if (bytes > MAX_RESPONSE_BYTES) {
+              fail(new CloudApiError(ERROR_KINDS.network, "云端响应过大"));
+              return;
+            }
+            chunks.push(buffer);
+          });
+          res.on("end", () => {
+            ended = true;
+            finish(null, {
+              status: res.statusCode || 0,
+              headers: res.headers,
+              text: Buffer.concat(chunks, bytes).toString("utf8"),
+            });
+          });
+          if (settled) res.destroy();
+        },
+      );
+      req.on("timeout", () => fail(new CloudApiError(ERROR_KINDS.timeout, "请求超时")));
+      req.on("error", fail);
+      if (settled) {
+        req.destroy();
         return;
       }
-      reject(new CloudApiError(classifyTransportError(error), error?.message || "网络错误", { cause: error }));
-    });
-    if (payload) req.write(payload);
-    req.end();
+      if (payload) req.write(payload);
+      req.end();
+    } catch (error) {
+      fail(error);
+    }
   });
 }
 
@@ -420,6 +465,7 @@ module.exports = {
   CloudApiError,
   ERROR_KINDS,
   DEFAULT_TIMEOUT_MS,
+  request,
   BIND_PATH,
   PREFERENCE_PATH,
   EMAIL_CODE_PATH,

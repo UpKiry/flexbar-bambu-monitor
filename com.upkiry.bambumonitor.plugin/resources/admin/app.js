@@ -14,6 +14,7 @@
     "refresh-btn",
     "login-btn",
     "send-code-btn",
+    "switch-password-btn",
     "logout-btn",
     "refresh-devices-btn",
     "test-connection-btn",
@@ -29,6 +30,11 @@
     busy: false,
     statusTimer: null,
     diagnosticsTimer: null,
+    requests: { status: null, diagnostics: null },
+    generation: 0,
+    statusFailures: 0,
+    lastStatusAt: null,
+    serviceUnavailable: false,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -122,7 +128,8 @@
   // ---------------------------------------------------------------------
 
   async function api(path, { method = "GET", body } = {}) {
-    const headers = { Authorization: `Bearer ${state.token}` };
+    const requestToken = state.token;
+    const headers = { Authorization: `Bearer ${requestToken}` };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const response = await fetch(path, {
       method,
@@ -140,7 +147,7 @@
     }
 
     if (response.status === 401) {
-      showTokenScreen("后台令牌无效或已过期，请从 FlexDesigner 设置页重新点击「进入后台」。");
+      if (state.token === requestToken) showTokenScreen("后台令牌无效或已过期，请从 FlexDesigner 设置页重新点击「进入后台」。");
       throw new Error("后台令牌无效");
     }
     if (!response.ok) {
@@ -187,7 +194,9 @@
     }
     const region = $("region-select");
     const printer = $("printer-select");
-    if (region) region.disabled = state.busy || Boolean(state.status?.auth?.state === "signed-in");
+    if (region) region.disabled = state.busy || state.awaitingCode || Boolean(state.status?.auth?.state === "signed-in");
+    const account = $("account-input");
+    if (account) account.readOnly = state.awaitingCode || state.busy;
     if (printer) printer.disabled = state.busy;
   }
 
@@ -215,27 +224,70 @@
     state.diagnosticsTimer = null;
   }
 
-  async function loadStatus({ silent = false } = {}) {
+  // 同一端点只保留一个请求；操作完成后等待旧请求结束，再读取新状态。
+  async function loadStatus({ silent = false, fresh = false } = {}) {
     if (!state.token) return;
-    try {
-      const data = await api("/api/status");
-      state.status = data;
-      renderStatus(data);
-      if (!silent) showMessage("状态已刷新", "success");
-    } catch (error) {
-      if (!silent && state.token) showMessage(error.message, "error");
+    if (state.requests.status) {
+      if (!fresh) return state.requests.status;
+      await state.requests.status;
+      if (!state.token) return;
+      if (state.requests.status) return loadStatus({ silent, fresh });
+    }
+    const generation = state.generation;
+    const request = (async () => {
+      try {
+        const data = await api("/api/status");
+        if (generation !== state.generation || !state.token) return;
+        state.statusFailures = 0;
+        state.lastStatusAt = Date.now();
+        if (state.serviceUnavailable) {
+          state.serviceUnavailable = false;
+          setHidden("service-warning", true);
+          showMessage("本地服务连接已恢复，状态已更新。", "success");
+        } else if (!silent) showMessage("状态已刷新", "success");
+        state.status = data;
+        renderStatus(data);
+      } catch (error) {
+        if (generation !== state.generation || !state.token) return;
+        state.statusFailures += 1;
+        if (state.statusFailures >= 2) {
+          state.serviceUnavailable = true;
+          const lastUpdate = state.lastStatusAt === null ? "尚未成功读取状态。" : `最后成功更新：${formatDateTime(state.lastStatusAt)}。`;
+          setText("service-warning", `无法连接本地服务，页面显示的可能是旧状态；${lastUpdate}请检查插件是否运行。恢复连接后会自动更新。`);
+          setHidden("service-warning", false);
+        }
+        if (!silent) showMessage(error.message, "error");
+      }
+    })();
+    state.requests.status = request;
+    try { await request; } finally {
+      if (state.requests.status === request) state.requests.status = null;
     }
   }
 
-  async function loadDiagnostics({ silent = false } = {}) {
+  async function loadDiagnostics({ silent = false, fresh = false } = {}) {
     if (!state.token) return;
-    try {
-      const data = await api("/api/diagnostics");
-      state.diagnostics = data;
-      renderDiagnostics(data);
-      if (!silent) showMessage("诊断信息已刷新", "success");
-    } catch (error) {
-      if (!silent && state.token) showMessage(error.message, "error");
+    if (state.requests.diagnostics) {
+      if (!fresh) return state.requests.diagnostics;
+      await state.requests.diagnostics;
+      if (!state.token) return;
+      if (state.requests.diagnostics) return loadDiagnostics({ silent, fresh });
+    }
+    const generation = state.generation;
+    const request = (async () => {
+      try {
+        const data = await api("/api/diagnostics");
+        if (generation !== state.generation || !state.token) return;
+        state.diagnostics = data;
+        renderDiagnostics(data);
+        if (!silent) showMessage("诊断信息已刷新", "success");
+      } catch (error) {
+        if (generation === state.generation && !silent && state.token) showMessage(error.message, "error");
+      }
+    })();
+    state.requests.diagnostics = request;
+    try { await request; } finally {
+      if (state.requests.diagnostics === request) state.requests.diagnostics = null;
     }
   }
 
@@ -360,7 +412,7 @@
       select.dataset.signature = signature;
     }
     select.value = current || "global";
-    select.disabled = state.busy || signedIn;
+    select.disabled = state.busy || signedIn || state.awaitingCode;
     setText("region-hint", signedIn
       ? "退出登录后才能切换区域。"
       : current === "china"
@@ -374,9 +426,12 @@
     const channel = currentRegion() === "china" ? "短信" : "邮箱";
     setHidden("password-field", awaiting);
     setHidden("code-field", !awaiting);
+    setText("code-label", `${channel}验证码`);
+    setText("code-hint", `验证码会发送到账号${channel === "短信" ? "手机" : "邮箱"}。若没有收到，可以重新发送。`);
     setText("login-btn", awaiting ? "提交验证码" : "登录");
     setText("send-code-btn", awaiting ? `重新发送${channel}验证码` : `发送${channel}验证码`);
     setHidden("switch-password-btn", !awaiting);
+    setBusy(state.busy);
   }
 
   function renderDevices(data, signedIn) {
@@ -398,14 +453,14 @@
 
     const select = $("printer-select");
     const selectedMissing = hasSelection && !devices.some((device) => device.id === selected);
-    const signature = `${devices.map((device) => device.id).join(",")}|${selectedMissing ? selected : ""}`;
+    const signature = JSON.stringify([devices.map((device) => [device.id, device.name, device.model, device.online]), selectedMissing ? selected : ""]);
     if (select.dataset.signature !== signature) {
       clear(select);
       const none = create("option", "", "不监控任何设备");
       none.value = "";
       select.appendChild(none);
       for (const device of devices) {
-        const suffix = device.online ? "（在线）" : "（离线）";
+        const suffix = device.online === true ? "（在线）" : device.online === false ? "（离线）" : "（在线状态未知）";
         const model = device.model ? ` · ${device.model}` : "";
         const option = create("option", "", `${device.name || device.id}${model}${suffix}`);
         option.value = device.id;
@@ -471,17 +526,7 @@
   }
 
   function renderSnapshot(data) {
-    const snapshot = {
-      auth: data.auth,
-      config: data.config,
-      credentialStore: data.credentialStore,
-      devices: data.devices,
-      devicesError: data.devicesError,
-      printer: data.printer,
-      display: data.display,
-      views: data.views,
-      admin: data.admin,
-    };
+    const snapshot = diagnosticExport().status;
     const text = JSON.stringify(snapshot, null, 2);
     const node = $("snapshot");
     if (node && node.textContent !== text) node.textContent = text;
@@ -527,6 +572,7 @@
   async function runAction(action, payload = {}) {
     if (!state.token || state.busy) return null;
     setBusy(true);
+    state.generation += 1;
     try {
       const response = await api("/api/action", {
         method: "POST",
@@ -534,8 +580,8 @@
       });
       const result = response.result || {};
       handleActionResult(action, result);
-      await loadStatus({ silent: true });
-      await loadDiagnostics({ silent: true });
+      await loadStatus({ silent: true, fresh: true });
+      await loadDiagnostics({ silent: true, fresh: true });
       return result;
     } catch (error) {
       if (state.token) showMessage(error.message, "error");
@@ -547,10 +593,19 @@
 
   function handleActionResult(action, result) {
     const status = result?.status;
+    if (action === "requestFullState" && typeof result?.sent === "boolean") {
+      if (result.sent) showMessage("完整状态请求已提交，等待设备上报。", "success");
+      else if (result.reason === "cooldown") {
+        const seconds = Number.isFinite(result.retryInMs) ? Math.max(1, Math.ceil(result.retryInMs / 1000)) : null;
+        showMessage(seconds ? `请求过于频繁，请在 ${seconds} 秒后重试。` : "请求过于频繁，请稍后重试。", "warning");
+      } else if (result.reason === "not-connected") showMessage("当前未连接云端，无法请求完整状态。", "warning");
+      else showMessage("完整状态请求发送失败，请稍后重试。", "error");
+      return;
+    }
     if (status === "code-required") {
       state.awaitingCode = true;
       renderLoginMode();
-      showMessage(result.message || "请输入邮箱验证码", "warning");
+      showMessage(`请输入${currentRegion() === "china" ? "短信" : "邮箱"}验证码`, "warning");
       const password = $("password-input");
       if (password) password.value = "";
       const code = $("code-input");
@@ -560,7 +615,7 @@
     if (status === "code-sent") {
       state.awaitingCode = true;
       renderLoginMode();
-      showMessage(result.message || "验证码已发送，请查收邮箱", "success");
+      showMessage(`验证码已发送，请查收${currentRegion() === "china" ? "短信" : "邮箱"}`, "success");
       const code = $("code-input");
       if (code) code.focus();
       return;
@@ -578,6 +633,12 @@
       return;
     }
     if (status === "success") {
+      if (action === "cancelCode") {
+        state.awaitingCode = false;
+        const code = $("code-input");
+        if (code) code.value = "";
+        renderLoginMode();
+      }
       if (action === "login") {
         state.awaitingCode = false;
         const password = $("password-input");
@@ -595,16 +656,13 @@
       showMessage(messageForAction(action, result), "success");
       return;
     }
-    if (action === "requestFullState" && result?.sent === false) {
-      showMessage("当前未连接云端，无法请求完整状态。", "warning");
-      return;
-    }
     showMessage(result?.message || "操作完成", "");
   }
 
   function messageForAction(action, result) {
     switch (action) {
       case "login": return "登录成功";
+      case "cancelCode": return "已取消验证码登录";
       case "logout": return "已退出登录";
       case "refreshDevices": return `已刷新设备列表（${Array.isArray(result?.devices) ? result.devices.length : 0} 台）`;
       case "setPrinter": return "已更新要显示的打印机";
@@ -693,6 +751,7 @@
   async function setRegion() {
     const select = $("region-select");
     if (!select) return;
+    if (state.awaitingCode) return;
     const region = select.value;
     const previous = state.status?.config?.region;
     if (!region || region === previous) return;
@@ -732,22 +791,48 @@
 
   function diagnosticExport() {
     const status = state.status || {};
+    const printer = status.printer || {};
+    const report = printer.state || {};
+    const link = printer.link || {};
+    const oneOf = (value, allowed) => allowed.includes(value) ? value : null;
+    const number = (value) => Number.isFinite(value) ? value : null;
+    const sensor = (value) => ({ current: number(value?.current), target: number(value?.target) });
+    const requests = Array.isArray(state.diagnostics?.requests) ? state.diagnostics.requests : [];
     return {
       generatedAt: new Date().toISOString(),
       status: {
-        auth: status.auth,
-        config: status.config,
-        credentialStore: status.credentialStore,
-        devices: status.devices,
-        devicesError: status.devicesError,
-        printer: status.printer,
-        display: status.display,
-        views: status.views,
-        admin: status.admin,
+        authState: oneOf(status.auth?.state, ["signed-in", "signed-out", "expired"]),
+        region: oneOf(status.config?.region, ["global", "china"]),
+        credentialStoreAvailable: status.credentialStore?.available === true,
+        deviceCount: Array.isArray(status.devices) ? status.devices.length : null,
+        link: {
+          state: oneOf(link.state, ["idle", "connecting", "connected", "reconnecting", "failed"]),
+          attempt: number(link.attempt),
+          subscribed: link.subscribed === true,
+        },
+        printerState: {
+          activity: oneOf(report.activity, ["idle", "preparing", "printing", "paused", "finished", "failed", "unknown"]),
+          lastReportAt: number(report.lastReportAt),
+          progressPercent: number(report.progressPercent),
+          remainingMinutes: number(report.remainingMinutes),
+          nozzle: sensor(report.nozzle),
+          bed: sensor(report.bed),
+        },
       },
-      diagnostics: state.diagnostics
-        ? { logs: state.diagnostics.logs, requests: state.diagnostics.requests }
-        : null,
+      diagnostics: {
+        // 路径、日志和错误文本可能包含任意标识，不纳入导出。
+        requests: requests.map((request) => ({
+          at: number(request.at),
+          method: oneOf(request.method, ["GET", "POST", "PUT", "DELETE", "PATCH"]),
+          status: number(request.status),
+          kind: oneOf(request.kind, [
+            "invalid-credentials", "verification-required", "verification-invalid", "invalid-phone",
+            "two-factor-required", "rate-limited", "network", "timeout", "region-mismatch",
+            "unauthorized", "device-list-unavailable", "unknown",
+          ]),
+          durationMs: number(request.durationMs),
+        })),
+      },
     };
   }
 
@@ -755,7 +840,7 @@
     const text = JSON.stringify(diagnosticExport(), null, 2);
     try {
       await navigator.clipboard.writeText(text);
-      showMessage("诊断信息已复制（不含令牌）", "success");
+      showMessage("诊断信息已复制（已隐去用户、设备和任务标识）", "success");
       return;
     } catch {
       // 回退到隐藏 textarea + execCommand。
@@ -763,7 +848,7 @@
 
     const fallback = $("copy-fallback");
     if (!fallback) {
-      showMessage("无法复制诊断信息，请展开状态快照手动复制。", "error");
+      showMessage("无法复制诊断信息，请展开已隐去标识的状态快照手动复制。", "error");
       return;
     }
     fallback.hidden = false;
@@ -776,7 +861,7 @@
       copied = false;
     }
     fallback.hidden = true;
-    showMessage(copied ? "诊断信息已复制（不含令牌）" : "无法复制诊断信息，请展开状态快照手动复制。", copied ? "success" : "error");
+    showMessage(copied ? "诊断信息已复制（已隐去用户、设备和任务标识）" : "无法复制诊断信息，请展开已隐去标识的状态快照手动复制。", copied ? "success" : "error");
   }
 
   // ---------------------------------------------------------------------
@@ -880,6 +965,7 @@
 
   function showTokenScreen(message) {
     stopPolling();
+    state.generation += 1;
     state.token = "";
     clearStoredToken();
     setHidden("app", true);
@@ -898,6 +984,11 @@
         if (node) node.textContent = "没有识别到有效令牌，请重新粘贴。";
         return;
       }
+      state.generation += 1;
+      state.statusFailures = 0;
+      state.lastStatusAt = null;
+      state.serviceUnavailable = false;
+      setHidden("service-warning", true);
       state.token = token;
       persistToken(token);
       stripTokenFromAddress();
@@ -910,11 +1001,9 @@
 
     $("login-form").addEventListener("submit", submitLogin);
     $("send-code-btn").addEventListener("click", sendCode);
-    $("switch-password-btn").addEventListener("click", () => {
-      state.awaitingCode = false;
-      renderLoginMode();
-      const password = $("password-input");
-      if (password) password.focus();
+    $("switch-password-btn").addEventListener("click", async () => {
+      const result = await runAction("cancelCode");
+      if (result?.status === "success") $("password-input")?.focus();
     });
     $("logout-btn").addEventListener("click", logout);
     $("region-select").addEventListener("change", setRegion);

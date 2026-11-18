@@ -36,6 +36,7 @@
 
       <main class="layout">
         <div id="banner" class="banner" hidden></div>
+        <div id="service-warning" class="banner error" role="alert" hidden></div>
         <div id="message" class="message" role="status" aria-live="polite" hidden></div>
 
         <section class="card account-card">
@@ -75,15 +76,15 @@
             </div>
 
             <div id="code-field" class="field" hidden>
-              <label for="code-input">邮箱验证码</label>
+              <label id="code-label" for="code-input">邮箱验证码</label>
               <input id="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" spellcheck="false">
-              <p class="hint">验证码会发送到账号邮箱。若没有收到，可以重新发送。</p>
+              <p id="code-hint" class="hint">验证码会发送到账号邮箱。若没有收到，可以重新发送。</p>
             </div>
 
             <div class="actions">
               <button id="login-btn" type="submit" class="primary">登录</button>
               <button id="send-code-btn" type="button" class="secondary">发送验证码</button>
-              <button id="switch-password-btn" type="button" class="linkish" hidden>改用密码登录</button>
+              <button id="switch-password-btn" type="button" class="linkish" hidden>取消验证码登录</button>
             </div>
             <p class="hint">密码和验证码只用于本次登录，不会保存；令牌写入系统安全存储或仅保留在内存中。中国大陆账号需要短信验证码，全球账号需要邮箱验证码。</p>
           </form>
@@ -118,6 +119,7 @@
               <div><dt>热床</dt><dd id="bed-text">—</dd></div>
               <div><dt>错误码</dt><dd id="error-code">—</dd></div>
             </dl>
+            <p class="hint">最近报文是插件最近收到设备状态的时间，不代表设备当前仍在线。云端断连时，显示的状态可能是断连前的旧数据。</p>
             <progress id="progress-bar" max="100" value="0" hidden></progress>
 
             <div class="actions">
@@ -164,7 +166,7 @@
           <p id="logs-empty" class="empty">暂无日志。</p>
 
           <details class="snapshot">
-            <summary>状态快照（不含令牌）</summary>
+            <summary>状态快照（已隐去用户、设备和任务标识）</summary>
             <pre id="snapshot">—</pre>
           </details>
         </section>

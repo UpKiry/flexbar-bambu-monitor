@@ -98,6 +98,9 @@ test("stale data is marked instead of pretending to be live", () => {
   assert.equal(display.title, "数据已过期");
   assert.equal(display.stale, true);
   assert.equal(display.tone, "warning");
+  for (const activity of ["idle", "paused", "finished", "failed"]) {
+    assert.equal(displayFor({ ...idleState, activity }, { link: { state: "reconnecting" } }).title, "数据已过期");
+  }
 });
 
 test("paused, finished and failed states have distinct tones", () => {
