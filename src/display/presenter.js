@@ -6,6 +6,8 @@
  */
 
 const VIEWS = ["progress", "temperature", "task"];
+// 连接仍存在时也可能很久没有设备报告；阈值只表示数据旧，不表示设备离线。
+const REPORT_STALE_MS = 5 * 60_000;
 
 const TONES = {
   muted: "muted",
@@ -14,6 +16,13 @@ const TONES = {
   warning: "warning",
   critical: "critical",
 };
+
+function fieldIsFresh(state, field, now) {
+  // 兼容未带字段级信息的旧状态；新模型缺少标记表示未报告。
+  if (!state?.freshness?.fields) return state?.reportStale !== true && Number.isFinite(state?.lastReportAt) && now - state.lastReportAt < REPORT_STALE_MS;
+  const mark = state.freshness.fields[field];
+  return Boolean(mark && mark.stale === false && Number.isFinite(mark.at) && now >= mark.at && now - mark.at < REPORT_STALE_MS);
+}
 
 /**
  * 按设计文档的表格生成展示文案。
@@ -66,13 +75,38 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
     return { tone: TONES.muted, title: "等待打印机状态", subtitle: "", icon: "clock", stale: true };
   }
 
-  const stale = linkState !== "connected";
   const activity = state.activity || "unknown";
+  const hasFieldMarks = Boolean(state.freshness?.fields);
+  const freshError = hasFieldMarks
+    ? (state.printError && fieldIsFresh(state, "printError", now) ? state.printError
+      : state.printErrorCode && fieldIsFresh(state, "printErrorCode", now) ? state.printErrorCode : null)
+    : state.errorCode;
+  const freshHms = Array.isArray(state.hms) && state.hms.length > 0 && fieldIsFresh(state, "hms", now);
+  if (linkState === "connected" && (freshError || freshHms)) {
+    return {
+      tone: TONES.critical,
+      title: activity === "failed" && fieldIsFresh(state, "activity", now) ? "打印异常" : "设备报告故障",
+      subtitle: freshError ? `错误码 ${freshError}` : "请在后台查看故障原始信息",
+      icon: "alert",
+      stale: false,
+    };
+  }
+
+  const timedOut = Number.isFinite(state.lastReportAt) && now - state.lastReportAt >= REPORT_STALE_MS;
+  const relevantFields = ["activity"];
+  if (activity === "printing" || activity === "paused") {
+    if (state.progressPercent !== null) relevantFields.push("progressPercent");
+    if (activity === "printing" && state.remainingMinutes !== null) relevantFields.push("remainingMinutes");
+  } else if ((activity === "finished" || activity === "preparing") && state.taskName) relevantFields.push("taskName");
+  else if (activity === "idle" && state.nozzle?.current !== null && state.nozzle?.current !== undefined) relevantFields.push("nozzle.current");
+  const fieldsStale = hasFieldMarks && relevantFields.some((field) => !fieldIsFresh(state, field, now));
+  const stale = linkState !== "connected" || state.reportStale === true || timedOut || fieldsStale;
   if (stale) {
     return {
       tone: TONES.warning,
       title: "数据已过期",
-      subtitle: "云端连接中断，显示最后已知状态",
+      subtitle: linkState !== "connected" ? "云端连接中断，显示最后已知状态"
+        : timedOut ? "长时间未收到设备状态" : fieldsStale ? "部分显示数据较旧" : "等待重新收到设备状态",
       icon: "cloud-off",
       stale: true,
     };
@@ -103,7 +137,7 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
     return {
       tone: TONES.critical,
       title: "打印异常",
-      subtitle: state.errorCode ? `错误码 ${state.errorCode}` : "设备报告打印失败",
+      subtitle: freshError ? `错误码 ${freshError}` : "设备报告打印失败",
       icon: "alert",
       stale,
     };
@@ -278,6 +312,7 @@ module.exports = {
   VIEWS,
   TONES,
   buildDisplay,
+  fieldIsFresh,
   buildViewDetails,
   formatPercent,
   formatMinutes,

@@ -22,7 +22,7 @@ function makeApi(overrides = {}) {
     fetchDevices: overrides.fetchDevices || (async () => [
       { id: "DEV1", name: "X1-01", model: "X1 Carbon", online: true, printStatus: "SUCCESS", nozzleDiameter: "0.4" },
     ]),
-    logout: async () => true,
+    logout: overrides.logout || (async () => true),
   };
 }
 
@@ -70,7 +70,7 @@ function makePlugin({ config = { region: "global", printerId: "", printerName: "
   };
 }
 
-function makeRuntime({ config, apiOverrides, plugin } = {}) {
+function makeRuntime({ config, apiOverrides, plugin, credentialStore = makeStore() } = {}) {
   const host = plugin || makePlugin({ config });
   const { factory, created } = makeFakeMqtt();
   const logs = { errors: [], warns: [], infos: [] };
@@ -83,7 +83,7 @@ function makeRuntime({ config, apiOverrides, plugin } = {}) {
       debug: () => {},
     },
     createApi: () => makeApi(apiOverrides),
-    credentialStore: makeStore(),
+    credentialStore,
     configRetryDelayMs: 1,
     createMqttManager: (options) => {
       const { createPrinterManager } = require("../src/printer/printer-manager");
@@ -92,6 +92,13 @@ function makeRuntime({ config, apiOverrides, plugin } = {}) {
     now: () => 9000,
   });
   return { runtime, host, mqtt: created, logs };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function keys() {
@@ -120,6 +127,25 @@ test("startup with no session draws the signed-out prompt", async () => {
   assert.equal(host.draws.at(-1).format, "draw");
 });
 
+test("shutdown during config loading prevents later hydration and connection", async () => {
+  const config = deferred();
+  const entered = deferred();
+  const host = makePlugin();
+  host.getConfig = () => { entered.resolve(); return config.promise; };
+  let reads = 0;
+  const credentialStore = makeStore();
+  credentialStore.load = async () => { reads += 1; return JSON.stringify({ accessToken: "tok", userId: "42", region: "global" }); };
+  const { runtime, mqtt } = makeRuntime({ plugin: host, credentialStore });
+  const starting = runtime.start();
+  await entered.promise;
+  await runtime.shutdown();
+  config.resolve({ region: "global", printerId: "DEV1" });
+  await starting;
+  assert.equal(reads, 0);
+  assert.equal(mqtt.length, 0);
+  assert.equal(runtime.config.printerId, "");
+});
+
 test("login flow refreshes devices, connects and draws the selected printer", async () => {
   const { runtime, host, mqtt } = makeRuntime();
   await runtime.start();
@@ -142,6 +168,62 @@ test("login flow refreshes devices, connects and draws the selected printer", as
   const titles = host.draws.map((draw) => draw.title);
   assert.ok(titles.some((title) => title.startsWith("打印中")), `expected 打印中, got ${titles.join(",")}`);
   assert.ok(titles.some((title) => /41%/.test(title)), `expected progress in title, got ${titles.join(",")}`);
+});
+
+for (const firstAction of ["login", "requestCode"]) {
+  for (const secondAction of ["login", "requestCode"]) {
+    test(`${firstAction} 收到并发 ${secondAction} busy 时仍完成首次登录收尾`, async () => {
+      const pending = deferred();
+      const login = { accessToken: "tok", expiresInSeconds: 3600 };
+      let fetchCount = 0;
+      const { runtime, mqtt } = makeRuntime({ apiOverrides: {
+        login: () => pending.promise,
+        requestEmailCode: () => pending.promise,
+        fetchDevices: async () => { fetchCount += 1; return [{ id: "DEV1", name: "设备" }]; },
+      } });
+      await runtime.start();
+      const first = runtime.actions[firstAction]({ account: "a@b.c", password: "pw" });
+      const second = await runtime.actions[secondAction]({ account: "a@b.c", password: "pw" });
+      assert.equal(second.status, "busy");
+      pending.resolve(firstAction === "login" ? login : { codeSent: false, login });
+      assert.equal((await first).status, "success");
+      assert.equal(fetchCount, 1);
+      assert.equal(runtime.config.printerId, "DEV1");
+      assert.equal(mqtt.length, 1);
+      await runtime.shutdown();
+    });
+  }
+}
+
+test("验证码提交遇到并发 busy 仍完成登录收尾", async () => {
+  const pending = deferred();
+  const { runtime, mqtt } = makeRuntime({ apiOverrides: {
+    requestEmailCode: async () => ({ codeSent: true }),
+    login: () => pending.promise,
+  } });
+  await runtime.start();
+  assert.equal((await runtime.actions.requestCode({ account: "a@b.c" })).status, "code-sent");
+  const first = runtime.actions.login({ code: "123456" });
+  assert.equal((await runtime.actions.login({ code: "123456" })).status, "busy");
+  pending.resolve({ accessToken: "tok", expiresInSeconds: 3600 });
+  assert.equal((await first).status, "success");
+  assert.equal(runtime.devices[0].id, "DEV1");
+  assert.equal(mqtt.length, 1);
+  await runtime.shutdown();
+});
+
+test("取消认证后迟到响应不会启动监控", async () => {
+  const pending = deferred();
+  const { runtime, mqtt } = makeRuntime({ apiOverrides: { login: () => pending.promise } });
+  await runtime.start();
+  const first = runtime.actions.login({ account: "a@b.c", password: "pw" });
+  await runtime.actions.cancelCode();
+  assert.equal((await runtime.actions.login({ account: "a@b.c", password: "pw" })).status, "busy");
+  pending.resolve({ accessToken: "tok", expiresInSeconds: 3600 });
+  assert.equal((await first).status, "cancelled");
+  assert.equal(mqtt.length, 0);
+  assert.deepEqual(runtime.devices, []);
+  await runtime.shutdown();
 });
 
 test("unknown UI actions are rejected without throwing", async () => {
@@ -192,6 +274,37 @@ test("setPrinter persists selection and restarts monitoring", async () => {
   assert.equal(mqtt.length, before);
 });
 
+test("旧会话设备选择写入迟到时不连接新会话", async () => {
+  const host = makePlugin({ config: { region: "global", printerId: "", printerName: "" } });
+  const entered = deferred();
+  const unblock = deferred();
+  const writes = [];
+  host.setConfig = async (next) => {
+    writes.push({ ...next });
+    if (next.printerId === "OLD") { entered.resolve(); await unblock.promise; }
+  };
+  let loginCount = 0;
+  const { runtime, mqtt } = makeRuntime({ plugin: host, apiOverrides: {
+    login: async () => ({ accessToken: `token-${++loginCount}`, expiresInSeconds: 3600 }),
+    fetchDevices: async (token) => token === "token-1"
+      ? [{ id: "OLD", name: "旧设备" }, { id: "OTHER", name: "其他" }]
+      : [{ id: "NEW", name: "新设备" }],
+  } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  const selecting = runtime.actions.setPrinter({ printerId: "OLD" });
+  await entered.promise;
+  await runtime.actions.logout();
+  const newLogin = runtime.actions.login({ account: "a@b.c", password: "pw" });
+  unblock.resolve();
+  assert.equal((await selecting).status, "cancelled");
+  assert.equal((await newLogin).status, "success");
+  assert.equal(runtime.config.printerId, "NEW");
+  assert.ok(writes.some((entry) => entry.printerId === ""));
+  assert.ok(!mqtt.some((entry) => entry.options.deviceId === "OLD" && entry.options.password === "token-2"));
+  await runtime.shutdown();
+});
+
 test("logout disconnects, clears credentials and prompts login again", async () => {
   const { runtime, host, mqtt } = makeRuntime();
   await runtime.start();
@@ -204,6 +317,205 @@ test("logout disconnects, clears credentials and prompts login again", async () 
   assert.equal(mqtt[0].stopped, true);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.match(host.draws.at(-1).title, /^请登录/);
+});
+
+test("logout clears the displayed session even when credential deletion fails", async () => {
+  const credentialStore = makeStore();
+  credentialStore.clear = async () => { throw new Error("synthetic failure"); };
+  const { runtime, host, mqtt } = makeRuntime({ credentialStore });
+  await runtime.start();
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: keys() });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  const result = await runtime.actions.logout();
+  assert.equal(result.status, "error");
+  assert.match(result.message, /钥匙串/);
+  assert.equal(mqtt[0].stopped, true);
+  const status = await runtime.actions.status();
+  assert.equal(status.auth.state, "signed-out");
+  assert.deepEqual(status.devices, []);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(host.draws.at(-1).title, /^请登录/);
+});
+
+test("切换账号后仅连接当前列表中存在的设备，保留旧配置", async () => {
+  let account = 0;
+  const { runtime, mqtt, host } = makeRuntime({ apiOverrides: {
+    login: async () => ({ accessToken: `token-${++account}`, expiresInSeconds: 3600 }),
+    fetchDevices: async (token) => [{ id: token === "token-1" ? "OLD" : "NEW", name: "设备" }],
+  } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  assert.equal(runtime.config.printerId, "OLD");
+  await runtime.actions.login({ account: "b@b.c", password: "pw" });
+  assert.equal(mqtt.length, 1);
+  assert.equal(mqtt[0].stopped, true);
+  assert.equal(runtime.config.printerId, "OLD");
+  assert.match((await runtime.actions.status()).display.subtitle, /不在当前账号/);
+  assert.equal(host.savedConfigs.length, 1);
+  await runtime.actions.setPrinter({ printerId: "NEW" });
+  assert.equal(mqtt[1].options.deviceId, "NEW");
+  assert.equal(mqtt[1].options.password, "token-2");
+});
+
+test("恢复会话先验证设备列表，失败保留配置并提示", async () => {
+  const pending = deferred();
+  const credentialStore = makeStore();
+  credentialStore.load = async () => JSON.stringify({ accessToken: "tok", userId: "42", region: "global" });
+  const { runtime, mqtt } = makeRuntime({ config: { region: "global", printerId: "DEV1", printerName: "打印机" }, credentialStore,
+    apiOverrides: { fetchDevices: () => pending.promise } });
+  await runtime.start();
+  assert.equal(mqtt.length, 0);
+  assert.match((await runtime.actions.status()).display.subtitle, /等待验证/);
+  pending.reject(new Error("network"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt.length, 0);
+  assert.equal(runtime.config.printerId, "DEV1");
+  assert.match((await runtime.actions.status()).display.subtitle, /读取失败/);
+});
+
+test("恢复会话设备验证通过后才连接", async () => {
+  const pending = deferred();
+  const credentialStore = makeStore();
+  credentialStore.load = async () => JSON.stringify({ accessToken: "tok", userId: "42", region: "global" });
+  const { runtime, mqtt } = makeRuntime({ config: { region: "global", printerId: "DEV1" }, credentialStore,
+    apiOverrides: { fetchDevices: () => pending.promise } });
+  await runtime.start();
+  assert.equal(mqtt.length, 0);
+  pending.resolve([{ id: "DEV1", name: "设备" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt.length, 1);
+  assert.equal(mqtt[0].options.deviceId, "DEV1");
+});
+
+test("刷新发现解绑或失败时断开连接并保留配置", async () => {
+  let count = 0;
+  const { runtime, mqtt } = makeRuntime({ apiOverrides: { fetchDevices: async () => {
+    count += 1;
+    if (count === 1) return [{ id: "DEV1", name: "设备" }];
+    if (count === 2) return [];
+    throw new Error("network");
+  } } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  await runtime.actions.refreshDevices();
+  assert.equal(mqtt[0].stopped, true);
+  assert.equal(runtime.config.printerId, "DEV1");
+  assert.match((await runtime.actions.status()).display.subtitle, /不在当前账号/);
+  await runtime.actions.refreshDevices();
+  assert.equal(mqtt.length, 1);
+  assert.match((await runtime.actions.status()).display.subtitle, /读取失败/);
+});
+
+test("连接测试迟到结果不返回旧账号设备", async () => {
+  const pending = deferred();
+  let count = 0;
+  const { runtime } = makeRuntime({ apiOverrides: { fetchDevices: () => ++count === 1 ? Promise.resolve([]) : pending.promise } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  const request = runtime.actions.testConnection();
+  await runtime.actions.logout();
+  pending.resolve([{ id: "OLD", name: "旧设备" }]);
+  assert.deepEqual(await request, { status: "cancelled" });
+});
+
+test("late device response after logout cannot select or reconnect", async () => {
+  let resolveDevices;
+  const { runtime, host, mqtt } = makeRuntime({ apiOverrides: { fetchDevices: () => new Promise((resolve) => { resolveDevices = resolve; }) } });
+  await runtime.start();
+  const login = runtime.actions.login({ account: "a@b.c", password: "pw" });
+  while (!resolveDevices) await new Promise((resolve) => setImmediate(resolve));
+  await runtime.actions.logout();
+  resolveDevices([{ id: "STALE", name: "Old" }]);
+  await login;
+  assert.deepEqual(runtime.devices, []);
+  assert.equal(runtime.config.printerId, "");
+  assert.equal(host.savedConfigs.length, 0);
+  assert.equal(mqtt.length, 0);
+});
+
+test("late unauthorized response cannot invalidate a newer session", async () => {
+  let rejectOld;
+  let count = 0;
+  const { runtime } = makeRuntime({ apiOverrides: { fetchDevices: () => {
+    count += 1;
+    return count === 1 ? new Promise((_resolve, reject) => { rejectOld = reject; }) : Promise.resolve([]);
+  } } });
+  await runtime.start();
+  const first = runtime.actions.login({ account: "a@b.c", password: "pw" });
+  while (!rejectOld) await new Promise((resolve) => setImmediate(resolve));
+  await runtime.actions.logout();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  rejectOld(Object.assign(new Error("old"), { kind: "unauthorized" }));
+  await first;
+  assert.equal(runtime.auth.state, "signed-in");
+});
+
+test("concurrent device refresh discards older results and errors", async () => {
+  const old = deferred();
+  let count = 0;
+  const { runtime } = makeRuntime({ apiOverrides: { fetchDevices: async () => {
+    count += 1;
+    if (count === 1) return [];
+    if (count === 2) return old.promise;
+    return [{ id: "NEW", name: "New" }];
+  } } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  const previous = runtime.actions.refreshDevices();
+  await runtime.actions.refreshDevices();
+  old.reject(Object.assign(new Error("old"), { kind: "unauthorized" }));
+  assert.equal((await previous).status, "cancelled");
+  assert.equal(runtime.auth.state, "signed-in");
+  assert.equal(runtime.devices[0].id, "NEW");
+});
+
+test("MQTT authorization failure expires the current session", async () => {
+  const { runtime, mqtt } = makeRuntime();
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  mqtt[0].pushStatus({ state: CONNECTION_STATES.failed, lastError: { kind: "unauthorized" }, subscribed: false });
+  assert.equal(runtime.auth.state, "expired");
+  assert.deepEqual(runtime.devices, []);
+  assert.equal(mqtt[0].stopped, true);
+});
+
+test("logout reports connection close failure and still clears credentials", async () => {
+  const credentialStore = makeStore();
+  let cleared = false;
+  const clear = credentialStore.clear;
+  credentialStore.clear = async () => { cleared = true; await clear(); };
+  const { runtime } = makeRuntime({ credentialStore });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  runtime.printer.disconnect = () => Promise.reject(new Error("fake-secret"));
+  const result = await runtime.actions.logout();
+  assert.equal(result.status, "error");
+  assert.match(result.message, /无法确认云端连接已关闭/);
+  assert.equal(cleared, true);
+  assert.equal(runtime.auth.state, "signed-out");
+});
+
+test("旧退出等待远端撤销时新会话设备不被清除", async () => {
+  const revoke = deferred();
+  const started = deferred();
+  let loginCount = 0;
+  const { runtime, mqtt } = makeRuntime({ apiOverrides: {
+    login: async () => ({ accessToken: `token-${++loginCount}`, expiresInSeconds: 3600 }),
+    fetchDevices: async (token) => [{ id: token === "token-1" ? "DEV1" : "DEV2", name: "设备" }],
+    logout: async () => { started.resolve(); await revoke.promise; },
+  } });
+  await runtime.start();
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  const oldLogout = runtime.actions.logout();
+  await started.promise;
+  assert.deepEqual(runtime.devices, []);
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  revoke.resolve();
+  assert.equal((await oldLogout).status, "cancelled");
+  assert.equal(runtime.auth.state, "signed-in");
+  assert.equal(runtime.devices[0].id, "DEV2");
+  assert.ok(mqtt.every((client) => !client.started || client.options.password !== "token-2" || !client.stopped));
+  await runtime.shutdown();
 });
 
 test("device list failures surface as actionable errors", async () => {
@@ -360,6 +672,22 @@ test("temperature and task views work while idle, not just while printing", asyn
   const task = host.draws.at(-1).title;
   assert.match(task, /benchy/);
   assert.match(task, /3\/12 层/);
+});
+
+test("temperature and task views do not display stale fields as live", async () => {
+  const { runtime, host, mqtt } = makeRuntime();
+  await runtime.start();
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: keys() });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  mqtt[0].pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+  mqtt[0].pushReport({ raw: { gcode_state: "IDLE", nozzle_temper: 210, subtask_name: "old" }, receivedAt: -400000 });
+  mqtt[0].pushReport({ raw: { gcode_state: "IDLE" }, receivedAt: 9000 });
+  await host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: { ...keys()[0] } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(host.draws.at(-1).title, /数据已过期/);
+  await host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: { ...keys()[0] } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(host.draws.at(-1).title, /数据已过期/);
 });
 
 test("before the first report the key shows the waiting prompt in every view", async () => {

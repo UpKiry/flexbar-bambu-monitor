@@ -12,19 +12,176 @@ const {
  * - 增量报文缺失的字段保留旧值；
  * - 报文里显式出现的字段按已验证的字段语义处理（温度、进度等用 null 表示不可用）；
  * - 收到完整快照、设备切换或任务切换时，按明确规则清理旧字段；
- * - 数组（如 AMS）不深合并，第一版直接不解析。
+ * - AMS 按设备及槽位 ID 合并增量，显式空数组清空该层。
  */
 
 /** 任务切换时需要清理的字段：这些字段属于上一个任务。 */
-const TASK_SCOPED_FIELDS = ["progressPercent", "remainingMinutes", "layerNum", "totalLayerNum", "errorCode"];
+const TASK_SCOPED_FIELDS = ["progressPercent", "remainingMinutes", "layerNum", "totalLayerNum"];
+const FRESH_FIELDS = {
+  activity: "activity", rawActivity: "rawActivity", progressPercent: "progressPercent",
+  remainingMinutes: "remainingMinutes", taskName: "taskName", rawTaskName: "rawTaskName",
+  taskId: "taskId", nozzleCurrent: "nozzle.current", nozzleTarget: "nozzle.target",
+  bedCurrent: "bed.current", bedTarget: "bed.target", layerNum: "layerNum",
+  totalLayerNum: "totalLayerNum", printError: "printError", printErrorCode: "printErrorCode", hms: "hms",
+};
+const MAX_FRESHNESS_UNITS = 64;
+const MAX_FRESHNESS_SLOTS = 16;
+// 与展示层使用相同的五分钟上报有效期。
+const AMS_PRESENCE_MAX_AGE_MS = 5 * 60_000;
+
+function presenceIsFresh(mark, at) {
+  return mark?.stale === false && Number.isFinite(mark.at) && Number.isFinite(at) &&
+    at >= mark.at && at - mark.at < AMS_PRESENCE_MAX_AGE_MS;
+}
+
+function stamp(at) {
+  return { at, stale: false };
+}
+
+function markStale(node) {
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") {
+      if (Object.hasOwn(value, "at") && Object.hasOwn(value, "stale")) value.stale = true;
+      else markStale(value);
+    }
+  }
+}
+
+function slotFreshness(freshness, unitId, slotId) {
+  let unit = freshness.units[unitId];
+  if (!unit) {
+    if (Object.keys(freshness.units).length >= MAX_FRESHNESS_UNITS) return null;
+    unit = freshness.units[unitId] = { slots: {} };
+  }
+  let slot = unit.slots[slotId];
+  if (!slot) {
+    if (Object.keys(unit.slots).length >= MAX_FRESHNESS_SLOTS) return null;
+    slot = unit.slots[slotId] = {};
+  }
+  return slot;
+}
+
+function recordAmsFreshness(freshness, oldAms, ams, patch, at, presenceFresh) {
+  if (patch === null) {
+    freshness.ams = { fields: { value: stamp(at) }, units: {} };
+    return;
+  }
+  const meta = freshness.ams;
+  if (Object.hasOwn(patch, "current")) meta.fields.current = stamp(at);
+  if (Object.hasOwn(patch, "rawTrayNow")) meta.fields.rawTrayNow = stamp(at);
+  if (Object.hasOwn(patch, "existBits")) meta.fields.existBits = stamp(at);
+  if (Object.hasOwn(patch, "units") && (!patch.units || patch.units.length === 0)) meta.units = {};
+  for (const unit of ams.units || []) {
+    const oldUnit = oldAms?.units?.find((item) => item.id === unit.id);
+    const update = patch.units?.find((item) => item.id === unit.id);
+    if (update && Object.hasOwn(update, "slots") && (!update.slots || update.slots.length === 0)) delete meta.units[unit.id];
+    for (const slot of unit.slots || []) {
+      const oldSlot = oldUnit?.slots?.find((item) => item.id === slot.id);
+      const change = update?.slots?.find((item) => item.id === slot.id);
+      const presenceChanged = oldSlot && oldSlot.exists !== slot.exists;
+      if (!change && !Object.hasOwn(patch, "existBits")) continue;
+      const slotMeta = slotFreshness(meta, unit.id, slot.id);
+      if (!slotMeta) continue;
+      if (Object.hasOwn(patch, "existBits") && slot.exists !== null) slotMeta.exists = stamp(at);
+      else if (!oldSlot && slot.exists !== null && meta.fields.existBits) slotMeta.exists = { ...meta.fields.existBits };
+      if (presenceChanged || (slot.exists === false && presenceFresh)) {
+        delete slotMeta.color;
+        delete slotMeta.material;
+        delete slotMeta.remaining;
+        delete slotMeta.rawState;
+      }
+      if (change) {
+        for (const key of ["color", "material", "remaining", "rawState"]) {
+          if (Object.hasOwn(change, key) && (slot.exists !== false || !presenceFresh || key === "rawState")) slotMeta[key] = stamp(at);
+        }
+      }
+    }
+  }
+}
 
 function cloneState(state) {
   return {
     ...state,
+    freshness: structuredClone(state.freshness || { fields: {}, ams: { fields: {}, units: {} } }),
     nozzle: { ...state.nozzle },
     bed: { ...state.bed },
     hms: state.hms ? state.hms.map((item) => ({ ...item })) : state.hms,
+    ams: state.ams ? {
+      ...state.ams,
+      current: state.ams.current ? { ...state.ams.current } : null,
+      units: state.ams.units?.map((unit) => ({ ...unit, slots: unit.slots?.map((slot) => ({ ...slot })) ?? null })) ?? null,
+    } : null,
   };
+}
+
+function emptyAms() {
+  return { units: [], current: null, rawTrayNow: null, rawStatus: null, existBits: null };
+}
+
+function updatePresence(slot, unitId, bits) {
+  const unit = Number(unitId);
+  const index = Number(slot.id);
+  if (bits == null || !Number.isSafeInteger(unit) || unit < 0 || unit >= 128 ||
+      !Number.isSafeInteger(index) || index < 0 || index >= 4) return;
+  const exists = ((BigInt(`0x${bits}`) >> BigInt(unit * 4 + index)) & 1n) === 1n;
+  if (!exists || slot.exists === false) {
+    slot.color = null;
+    slot.material = null;
+    slot.remaining = null;
+    slot.rawState = null;
+  }
+  slot.exists = exists;
+}
+
+function mergeAms(previous, patch, presenceFresh = true) {
+  if (patch === null) return null;
+  const result = previous || emptyAms();
+  if (Object.hasOwn(patch, "current")) result.current = patch.current;
+  if (Object.hasOwn(patch, "rawTrayNow")) result.rawTrayNow = patch.rawTrayNow;
+  if (Object.hasOwn(patch, "existBits")) {
+    result.existBits = patch.existBits;
+    for (const unit of result.units || []) {
+      for (const slot of unit.slots || []) updatePresence(slot, unit.id, result.existBits);
+    }
+  }
+  if (Object.hasOwn(patch, "units")) {
+    if (patch.units === null) {
+      result.units = null;
+      return result;
+    }
+    if (!patch.units.length || !result.units) result.units = [];
+    for (const update of patch.units) {
+      let unit = result.units.find((item) => item.id === update.id);
+      if (!unit) {
+        if (result.units.length >= MAX_FRESHNESS_UNITS) continue;
+        unit = { id: update.id, slots: null };
+        result.units.push(unit);
+      }
+      if (Object.hasOwn(update, "slots")) {
+        if (update.slots === null) {
+          unit.slots = null;
+          continue;
+        }
+        if (!update.slots.length || !unit.slots) unit.slots = [];
+        for (const updateSlot of update.slots) {
+          let slot = unit.slots.find((item) => item.id === updateSlot.id);
+          if (!slot) {
+            if (unit.slots.length >= MAX_FRESHNESS_SLOTS) continue;
+            slot = { id: updateSlot.id, color: null, material: null, remaining: null, rawState: null, exists: null };
+            if (presenceFresh) updatePresence(slot, unit.id, result.existBits);
+            unit.slots.push(slot);
+          }
+          if (slot.exists === false && presenceFresh) {
+            // Ignore material metadata for a slot reported absent.
+            if (Object.hasOwn(updateSlot, "rawState")) slot.rawState = updateSlot.rawState;
+          } else {
+            Object.assign(slot, updateSlot);
+          }
+        }
+      }
+    }
+  }
+  return result;
 }
 
 function clearTaskFields(state) {
@@ -45,11 +202,21 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
     return { state: base, reason: "invalid-report", taskSwitched: false };
   }
 
+  const patch = mapReport(raw);
+  if (Object.keys(patch).length === 0) {
+    return { state: base, reason: "empty-report", taskSwitched: false };
+  }
+
   let reason = null;
   let taskSwitched = false;
 
   if (isTaskSwitch(base, raw)) {
     clearTaskFields(base);
+    for (const key of [...TASK_SCOPED_FIELDS, "taskName", "rawTaskName", "taskId"]) delete base.freshness.fields[key];
+    // 切换后不能把旧任务的名称或标识留给后续增量。
+    base.taskName = null;
+    base.rawTaskName = null;
+    base.taskId = null;
     taskSwitched = true;
     reason = "task-switched";
   } else if (isFullSnapshot(raw) && base.lastReportAt !== null) {
@@ -57,7 +224,6 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
     reason = "full-snapshot";
   }
 
-  const patch = mapReport(raw);
   const next = { ...base };
 
   if (Object.hasOwn(patch, "activity")) {
@@ -66,9 +232,40 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
   }
   if (Object.hasOwn(patch, "progressPercent")) next.progressPercent = patch.progressPercent;
   if (Object.hasOwn(patch, "remainingMinutes")) next.remainingMinutes = patch.remainingMinutes;
-  if (Object.hasOwn(patch, "taskName")) next.taskName = patch.taskName;
-  if (Object.hasOwn(patch, "errorCode")) next.errorCode = patch.errorCode;
+  if (Object.hasOwn(patch, "taskName")) {
+    next.taskName = patch.taskName;
+    next.rawTaskName = patch.rawTaskName;
+  }
+  if (Object.hasOwn(patch, "taskId")) next.taskId = patch.taskId;
+  if (Object.hasOwn(patch, "printError")) next.printError = patch.printError;
+  if (Object.hasOwn(patch, "printErrorCode")) next.printErrorCode = patch.printErrorCode;
+  next.errorCode = (next.printError !== 0 ? next.printError : null) ?? (next.printErrorCode !== 0 ? next.printErrorCode : null) ?? null;
   if (Object.hasOwn(patch, "hms")) next.hms = patch.hms;
+  if (Object.hasOwn(patch, "ams")) {
+    const oldAms = next.ams ? structuredClone(next.ams) : null;
+    const hasNewBits = Object.hasOwn(patch.ams || {}, "existBits");
+    const presenceMeta = next.freshness.ams;
+    const presenceFresh = hasNewBits || presenceIsFresh(presenceMeta.fields.existBits, receivedAt);
+    if (!presenceFresh) {
+      // 长时间未更新、断线或时钟回退后，旧空槽只是旧观测，不能阻挡新数据。
+      if (presenceMeta.fields.existBits) presenceMeta.fields.existBits.stale = true;
+      for (const unit of Object.values(presenceMeta.units)) {
+        for (const slot of Object.values(unit.slots)) {
+          if (slot.exists) slot.exists.stale = true;
+        }
+      }
+    }
+    next.ams = mergeAms(next.ams, patch.ams, presenceFresh);
+    recordAmsFreshness(next.freshness, oldAms, next.ams, patch.ams, receivedAt, presenceFresh);
+    // 列表显式未知后，先前存在掩码不能约束重新出现的槽位；同报文的新掩码仍有效。
+    const resetList = patch.ams && (patch.ams.units === null || patch.ams.units?.some((unit) => unit.slots === null));
+    if (resetList && !hasNewBits && presenceMeta.fields.existBits) presenceMeta.fields.existBits.stale = true;
+  }
+  if (Object.hasOwn(patch, "amsStatus")) {
+    if (!next.ams) next.ams = emptyAms();
+    next.ams.rawStatus = patch.amsStatus;
+    next.freshness.ams.fields.rawStatus = stamp(receivedAt);
+  }
 
   if (Object.hasOwn(patch, "nozzleCurrent")) next.nozzle = { ...next.nozzle, current: patch.nozzleCurrent };
   if (Object.hasOwn(patch, "nozzleTarget")) next.nozzle = { ...next.nozzle, target: patch.nozzleTarget };
@@ -78,7 +275,12 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
   if (Object.hasOwn(patch, "layerNum")) next.layerNum = patch.layerNum;
   if (Object.hasOwn(patch, "totalLayerNum")) next.totalLayerNum = patch.totalLayerNum;
 
+  for (const [source, field] of Object.entries(FRESH_FIELDS)) {
+    if (Object.hasOwn(patch, source)) next.freshness.fields[field] = stamp(receivedAt);
+  }
   next.lastReportAt = receivedAt;
+  // 仅表示本连接已收到有效报告；各字段必须检查 freshness。
+  next.reportStale = false;
   return { state: next, reason, taskSwitched };
 }
 
@@ -88,6 +290,10 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
 function reduceConnection(state, connection) {
   const next = state ? cloneState(state) : emptyPrinterState();
   next.connection = connection;
+  if (connection !== "connected") {
+    next.reportStale = true;
+    markStale(next.freshness);
+  }
   return next;
 }
 

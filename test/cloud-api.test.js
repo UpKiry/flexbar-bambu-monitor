@@ -89,6 +89,31 @@ test("invalid credentials surface as a user readable message", async () => {
   );
 });
 
+test("server errors and transport exceptions never expose echoed credentials", async () => {
+  const secret = "FAKE-token-password-code-928374";
+  const events = [];
+  const api = new CloudApi({
+    requestFn: makeRequester([
+      { body: { accessToken: secret } },
+      { status: 500, body: { message: secret, code: secret } },
+      { status: 500, body: { error: secret, code: secret } },
+      new CloudApiError(ERROR_KINDS.network, secret, { cause: new Error(secret), code: secret }),
+    ]).fn,
+    onRequest: (event) => events.push(event),
+  });
+  const login = await api.login({ account: "a@b.c", password: secret });
+  assert.equal(login.accessToken, secret);
+  for (const operation of [() => api.fetchUserId(secret), () => api.fetchDevices(secret), () => api.fetchDevices(secret)]) {
+    await assert.rejects(operation, (error) => {
+      assert.ok(!String(error.stack).includes(secret));
+      assert.ok(!JSON.stringify(error).includes(secret));
+      assert.equal(error.cause, null);
+      return true;
+    });
+  }
+  assert.ok(!JSON.stringify(events).includes(secret));
+});
+
 test("network and timeout errors are classified", async () => {
   const networkError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
   const api = new CloudApi({ region: "global", requestFn: makeRequester([networkError]).fn });

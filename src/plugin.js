@@ -21,20 +21,20 @@ runtime.attachAdmin(admin);
 // 先连宿主：之后 runtime 才能读到配置、注册的事件也才会收到消息。
 plugin.start();
 
-runtime.start().catch((error) => {
-  logger.error(`Bambu Monitor 启动失败：${error?.message || error}`);
+runtime.start().catch(() => {
+  logger.error("Bambu Monitor 启动失败");
 });
 
 // 浏览器后台尽早启动，设置页点按钮时只需要拉起浏览器。
 // 启动失败不影响 Flexbar 监控，设置页会显示后台不可用。
-admin.start().catch((error) => {
-  logger.error(`浏览器后台启动失败：${error?.message || error}`);
+admin.start().catch(() => {
+  logger.error("浏览器后台启动失败");
 });
 
 // 进程退出时关闭本地后台并断开云端连接，避免留下监听端口或悬挂的 MQTT 会话。
 function shutdown() {
-  return runtime.shutdown().catch((error) => {
-    logger.error(`退出清理失败：${error?.message || error}`);
+  return runtime.shutdown().catch(() => {
+    logger.error("退出清理失败");
   });
 }
 function shutdownAndExit() {

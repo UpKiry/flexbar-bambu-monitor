@@ -27,8 +27,9 @@ function makeFakeClientFactory() {
     client.publish = (topic, payload, opts) => {
       client.published.push({ topic, payload, opts });
     };
-    client.end = () => {
+    client.end = (_force, callback) => {
       client.ended = true;
+      callback?.();
     };
     created.push(client);
     return client;
@@ -49,6 +50,7 @@ function makeClient(overrides = {}) {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     createClient: factory,
     random: () => 0.5,
+    ...(overrides.now ? { cooldownNow: overrides.now } : {}),
     ...overrides,
   });
   client.onStatus((status) => statuses.push(status));
@@ -114,6 +116,17 @@ test("unparsable payloads are ignored instead of crashing", () => {
   assert.equal(reports.length, 0);
 });
 
+test("oversized device reports are ignored without logging payloads", () => {
+  const logs = [];
+  const { client, created, reports } = makeClient({ logger: { info() {}, warn: (text) => logs.push(text), error: (text) => logs.push(text) } });
+  client.start();
+  created[0].emit("connect");
+  const text = JSON.stringify({ print: { gcode_state: "IDLE", padding: "X".repeat(256 * 1024) } });
+  created[0].emit("message", "device/DEV1/report", Buffer.from(text));
+  assert.equal(reports.length, 0);
+  assert.ok(!logs.join(" ").includes("XXXX"));
+});
+
 test("status reports are parsed and forwarded with a receive time", () => {
   const { client, created, reports } = makeClient({ now: () => 777 });
   client.start();
@@ -147,7 +160,8 @@ test("a thrown report handler does not break the connection", () => {
   const fake = created[0];
   fake.emit("connect");
   fake.emit("message", "device/DEV1/report", Buffer.from(JSON.stringify({ print: { gcode_state: "IDLE" } })));
-  assert.ok(logs.some((line) => line.includes("handler exploded")));
+  assert.ok(logs.includes("处理云端报文失败"));
+  assert.ok(logs.every((line) => !line.includes("handler exploded")));
 });
 
 test("unauthorized errors stop retrying and surface an auth failure", () => {
@@ -185,9 +199,54 @@ test("stop clears timers and ends the connection", () => {
   assert.equal(fake.ended, true);
 });
 
+test("stop waits for actual close before restart", async () => {
+  const { client, created } = makeClient();
+  client.start();
+  let done;
+  created[0].end = (_force, callback) => { done = callback; };
+  const stopped = client.stop();
+  let closed = false;
+  stopped.then(() => { closed = true; });
+  client.start();
+  await Promise.resolve();
+  assert.equal(closed, false);
+  assert.equal(created.length, 1);
+  done();
+  await stopped;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2);
+  await client.stop();
+});
+
+test("unconfirmed MQTT close times out and does not restart", async () => {
+  const { client, created } = makeClient({ closeTimeoutMs: 10 });
+  client.start();
+  created[0].end = () => {};
+  const stopped = client.stop();
+  client.start();
+  await assert.rejects(stopped, /关闭/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 1);
+  assert.equal(client.state, CONNECTION_STATES.failed);
+});
+
+test("pushall cooldown uses monotonic time despite wall-clock jumps", () => {
+  let wall = 1_000;
+  let monotonic = 50;
+  const { client, created } = makeClient({ deviceId: "CLOCK", now: () => wall, cooldownNow: () => monotonic, pushallCooldownMs: 300_000 });
+  client.start();
+  created[0].emit("connect");
+  assert.equal(client.requestFullState().sent, true);
+  wall += 86_400_000;
+  monotonic += 1_000;
+  assert.equal(client.requestFullState().reason, "cooldown");
+  monotonic += 299_000;
+  assert.equal(client.requestFullState().sent, true);
+});
+
 test("pushall requests are rate limited", () => {
   let clock = 0;
-  const { client, created } = makeClient({ now: () => clock, pushallCooldownMs: 300_000 });
+  const { client, created } = makeClient({ deviceId: "RATE", now: () => clock, pushallCooldownMs: 300_000 });
   client.start();
 
   assert.deepEqual(client.requestFullState(), { sent: false, reason: "not-connected" });
@@ -197,7 +256,7 @@ test("pushall requests are rate limited", () => {
   const first = client.requestFullState();
   assert.equal(first.sent, true);
   assert.equal(fake.published.length, 1);
-  assert.equal(fake.published[0].topic, "device/DEV1/request");
+  assert.equal(fake.published[0].topic, "device/RATE/request");
   assert.equal(JSON.parse(fake.published[0].payload).pushing.command, "pushall");
 
   clock = 1000;
@@ -210,7 +269,7 @@ test("pushall requests are rate limited", () => {
 });
 
 test("publish failures are reported instead of thrown", () => {
-  const { client, created } = makeClient();
+  const { client, created } = makeClient({ deviceId: "FAIL" });
   client.start();
   const fake = created[0];
   fake.emit("connect");
@@ -218,10 +277,10 @@ test("publish failures are reported instead of thrown", () => {
     throw new Error("publish exploded");
   };
   const result = client.requestFullState();
-  assert.equal(result.sent, false);
-  assert.match(result.reason, /publish exploded/);
+  assert.deepEqual(result, { sent: false, reason: "publish-failed" });
   fake.publish = () => {};
-  assert.equal(client.requestFullState().sent, true);
+  assert.equal(client.requestFullState().reason, "cooldown");
+  client.stop();
 });
 
 test("connection becomes ready only after subscription is acknowledged", () => {
@@ -259,7 +318,7 @@ test("subscription errors, rejected grants, and throws schedule reconnect", () =
   }
 });
 
-test("late callbacks from a stopped or replaced connection have no effect", () => {
+test("late callbacks from a stopped or replaced connection have no effect", async () => {
   const { client, created, reports } = makeClient();
   client.start();
   const old = created[0];
@@ -269,8 +328,10 @@ test("late callbacks from a stopped or replaced connection have no effect", () =
   const oldClose = old.listeners("close")[0];
   const oldError = old.listeners("error")[0];
   const oldMessage = old.listeners("message")[0];
-  client.stop();
+  const closed = client.stop();
   client.start();
+  await closed;
+  await new Promise((resolve) => setImmediate(resolve));
   created[1].emit("connect");
   complete(null);
   oldClose();
@@ -283,37 +344,62 @@ test("late callbacks from a stopped or replaced connection have no effect", () =
   client.stop();
 });
 
-test("failed publish restores the previous cooldown, including asynchronous errors", () => {
+test("cooldown is shared across replacement clients and cannot be forced", () => {
   let clock = 0;
-  const { client, created } = makeClient({ now: () => clock, pushallCooldownMs: 1000 });
-  client.start();
-  const fake = created[0];
-  fake.emit("connect");
-  assert.equal(client.requestFullState().sent, true);
+  const first = makeClient({ deviceId: "SHARED", now: () => clock, pushallCooldownMs: 1000 });
+  first.client.start();
+  first.created[0].emit("connect");
+  assert.equal(first.client.requestFullState().sent, true);
+  first.client.stop();
+  const second = makeClient({ deviceId: "SHARED", now: () => clock, pushallCooldownMs: 1000 });
+  second.client.start();
+  second.created[0].emit("connect");
   clock = 500;
-  fake.publish = () => { throw new Error("failed"); };
-  assert.equal(client.requestFullState({ force: true }).sent, false);
-  assert.deepEqual(client.requestFullState(), { sent: false, reason: "cooldown", retryInMs: 500 });
+  assert.deepEqual(second.client.requestFullState({ force: true }), { sent: false, reason: "cooldown", retryInMs: 500 });
+  assert.equal(second.created[0].published.length, 0);
   clock = 1000;
+  assert.equal(second.client.requestFullState().sent, true);
+  second.client.stop();
+});
+
+test("asynchronous publish failure retains cooldown and hides errors", () => {
+  let clock = 0;
+  const logs = [];
+  const { client, created } = makeClient({ deviceId: "ASYNC", now: () => clock, pushallCooldownMs: 1000,
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) } });
+  client.start();
+  created[0].emit("connect");
   let callback;
-  fake.publish = (topic, payload, options, done) => { callback = done; };
+  created[0].publish = (topic, payload, options, done) => { callback = done; };
   assert.equal(client.requestFullState().sent, true);
-  callback(new Error("asynchronous failure"));
+  callback(new Error("sensitive-token"));
+  assert.equal(client.requestFullState().reason, "cooldown");
+  assert.ok(logs.every((line) => !line.includes("sensitive-token")));
+  clock = 1000;
   assert.equal(client.requestFullState().sent, true);
   client.stop();
 });
 
-test("old publish failure cannot erase a newer request cooldown", () => {
-  let clock = 0;
-  const { client, created } = makeClient({ now: () => clock, pushallCooldownMs: 1000 });
+test("wildcards and topic separators are rejected in device IDs", () => {
+  for (const deviceId of ["abc/def", "abc+", "abc#", "abc\u0000"]) {
+    const { client, created } = makeClient({ deviceId });
+    assert.equal(client.start(), false);
+    assert.equal(created.length, 0);
+  }
+});
+
+test("exceptions and incoming payloads never appear in logs or connection status", () => {
+  const secret = "sensitive-token";
+  const logs = [];
+  const { client, created, statuses } = makeClient({ deviceId: "SAFE", logger: {
+    info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m),
+  } });
+  client.onStatus((s) => { statuses.push(s); throw new Error(secret); });
+  client.onReport(() => { throw new Error(secret); });
   client.start();
   created[0].emit("connect");
-  const callbacks = [];
-  created[0].publish = (topic, payload, options, callback) => callbacks.push(callback);
-  assert.equal(client.requestFullState().sent, true);
-  clock = 100;
-  assert.equal(client.requestFullState({ force: true }).sent, true);
-  callbacks[0](new Error("late failure"));
-  assert.equal(client.requestFullState().reason, "cooldown");
+  created[0].emit("message", reportTopic("SAFE"), Buffer.from(JSON.stringify({ print: { task: secret } })));
+  created[0].emit("error", { code: 1, message: secret });
+  assert.ok(!JSON.stringify({ logs, statuses, status: client.status() }).includes(secret));
   client.stop();
 });

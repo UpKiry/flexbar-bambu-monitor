@@ -84,7 +84,7 @@ function userMessageFor(kind, fallback, regionId) {
     case ERROR_KINDS.deviceListUnavailable:
       return "无法读取设备列表，请确认账号已在 Bambu 应用或 Bambu Studio 中绑定打印机";
     default:
-      return fallback || "云端请求失败";
+      return "云端请求失败";
   }
 }
 
@@ -183,10 +183,9 @@ function request({
       }
     }
     function fail(error) {
-      const mapped = error instanceof CloudApiError
-        ? error
-        : new CloudApiError(classifyTransportError(error), error?.message || "网络错误", { cause: error });
-      finish(mapped);
+      const kind = error instanceof CloudApiError && Object.values(ERROR_KINDS).includes(error.kind)
+        ? error.kind : classifyTransportError(error);
+      finish(new CloudApiError(kind, userMessageFor(kind)));
     }
 
     try {
@@ -286,10 +285,10 @@ class CloudApi {
         });
       } catch (error) {
         // 传输层错误统一在这里归类，调用方只需要面对 CloudApiError。
-        if (error instanceof CloudApiError) throw error;
-        const kind = classifyTransportError(error);
+        const kind = error instanceof CloudApiError && Object.values(ERROR_KINDS).includes(error.kind)
+          ? error.kind : classifyTransportError(error);
         errorKind = kind;
-        throw new CloudApiError(kind, userMessageFor(kind, error?.message), { cause: error });
+        throw new CloudApiError(kind, userMessageFor(kind, null, this.regionId));
       }
       responseStatus = response.status;
       this.lastRequestAt = Date.now();
@@ -301,7 +300,7 @@ class CloudApi {
           errorKind = kind;
           throw new CloudApiError(kind, userMessageFor(kind, parsed.error, this.regionId), {
             status: response.status,
-            code: parsed.code ?? null,
+            code: typeof parsed.code === "number" && Number.isSafeInteger(parsed.code) ? parsed.code : null,
           });
         }
         return parsed;
@@ -311,12 +310,15 @@ class CloudApi {
       errorKind = kind;
       throw new CloudApiError(kind, userMessageFor(kind, parsed?.error || parsed?.message, this.regionId), {
         status: response.status,
-        code: parsed?.code ?? null,
+        code: typeof parsed?.code === "number" && Number.isSafeInteger(parsed.code) ? parsed.code : null,
       });
     } catch (error) {
-      if (error instanceof CloudApiError) errorKind = error.kind;
-      else if (!errorKind) errorKind = classifyTransportError(error);
-      throw error;
+      if (error instanceof CloudApiError && Object.values(ERROR_KINDS).includes(error.kind)) {
+        errorKind = error.kind;
+        throw error;
+      }
+      errorKind = classifyTransportError(error);
+      throw new CloudApiError(errorKind, userMessageFor(errorKind));
     } finally {
       // 只上报脱敏元数据：不记录请求头、请求体、响应体或令牌。
       if (typeof this.onRequest === "function") {
@@ -373,7 +375,7 @@ class CloudApi {
     if (!accessToken) {
       const loginType = String(payload?.loginType || "");
       if (loginType === "verifyCode") {
-        throw new CloudApiError(ERROR_KINDS.verificationRequired, "该账号需要输入验证码", { code: payload?.code ?? null });
+        throw new CloudApiError(ERROR_KINDS.verificationRequired, "该账号需要输入验证码");
       }
       throw new CloudApiError(ERROR_KINDS.unknown, "登录响应中缺少令牌");
     }

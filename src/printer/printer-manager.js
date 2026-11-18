@@ -13,8 +13,11 @@ function createPrinterManager({
   createMqttClient = createCloudMqttClient,
   logger,
   now = () => Date.now(),
+  closeTimeoutMs = 6_000,
 } = {}) {
   let client = null;
+  let generation = 0;
+  let closing = null;
   let printerId = null;
   let printerName = null;
   let state = resetForPrinter(null);
@@ -25,19 +28,37 @@ function createPrinterManager({
     for (const listener of listeners) {
       try {
         listener(change);
-      } catch (error) {
-        logger?.warn?.(`状态回调失败：${error?.message || error}`);
+      } catch {
+        logger?.warn?.("状态回调失败");
       }
     }
   }
 
   function detachClient() {
-    if (!client) return;
+    if (!client) return closing;
     const previous = client;
     client = null;
     previous.onReport(null);
     previous.onStatus(null);
-    previous.stop();
+    let result;
+    try {
+      result = previous.stop();
+    } catch {
+      result = Promise.reject(new Error("无法确认旧连接已关闭"));
+    }
+    if (result && typeof result.then === "function") {
+      let timer;
+      const pending = Promise.race([
+        Promise.resolve(result),
+        new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("无法确认旧连接已关闭")), closeTimeoutMs); }),
+      ]);
+      pending.then(() => clearTimeout(timer), () => clearTimeout(timer));
+      closing = pending;
+      pending.then(() => {
+        if (closing === pending) closing = null;
+      }, () => {});
+    }
+    return closing;
   }
 
   function connectionStateFor(mqttState) {
@@ -62,6 +83,7 @@ function createPrinterManager({
       }
       return;
     }
+    generation += 1;
     detachClient();
     printerId = nextId;
     printerName = meta.name || null;
@@ -78,46 +100,67 @@ function createPrinterManager({
    */
   function connect({ host, port, userId, accessToken }) {
     if (!printerId) return { started: false, reason: "no-printer" };
-    detachClient();
+    const myGeneration = ++generation;
+    const selectedId = printerId;
+    const pending = detachClient();
     state = reduceConnection(resetForPrinter(printerId), "connecting");
+    lastStatus = { state: CONNECTION_STATES.connecting, attempt: 0, lastError: null, subscribed: false };
     notify({ type: "state", state, status: lastStatus });
 
-    const next = createMqttClient({
-      host,
-      port,
-      username: `u_${userId}`,
-      password: accessToken,
-      deviceId: printerId,
-      logger,
-      now,
-    });
-    client = next;
+    function startClient() {
+      if (generation !== myGeneration || printerId !== selectedId) return;
+      const next = createMqttClient({
+        host,
+        port,
+        username: `u_${userId}`,
+        password: accessToken,
+        deviceId: selectedId,
+        logger,
+        now,
+      });
+      client = next;
 
-    next.onStatus((status) => {
-      if (client !== next) return;
-      lastStatus = status;
-      const mapped = connectionStateFor(status.state);
-      state = reduceConnection(state, mapped);
-      notify({ type: "connection", status });
-      notify({ type: "state", state, status });
-    });
+      next.onStatus((status) => {
+        if (client !== next || generation !== myGeneration) return;
+        lastStatus = status;
+        const mapped = connectionStateFor(status.state);
+        state = reduceConnection(state, mapped);
+        notify({ type: "connection", status });
+        notify({ type: "state", state, status });
+      });
 
-    next.onReport(({ raw, receivedAt }) => {
-      if (client !== next) return;
-      const { state: merged, taskSwitched, reason } = reduceReport(state, raw, { receivedAt });
-      state = merged;
-      notify({ type: "report", state, taskSwitched, reason });
-    });
+      next.onReport(({ raw, receivedAt }) => {
+        if (client !== next || generation !== myGeneration) return;
+        const { state: merged, taskSwitched, reason } = reduceReport(state, raw, { receivedAt });
+        state = merged;
+        notify({ type: "report", state, taskSwitched, reason });
+      });
+      next.start();
+    }
 
-    next.start();
+    if (pending) {
+      pending.then(startClient, () => {
+        if (generation !== myGeneration) return;
+        lastStatus = { state: CONNECTION_STATES.failed, attempt: 0, lastError: { kind: "network", message: "无法确认旧连接已关闭" }, subscribed: false };
+        state = reduceConnection(state, "error");
+        notify({ type: "state", state, status: lastStatus });
+      }).catch(() => {
+        if (generation !== myGeneration) return;
+        lastStatus = { state: CONNECTION_STATES.failed, attempt: 0, lastError: { kind: "network", message: "无法启动云连接" }, subscribed: false };
+        state = reduceConnection(state, "error");
+        notify({ type: "state", state, status: lastStatus });
+      });
+    } else startClient();
     return { started: true, reason: null };
   }
 
   function disconnect() {
-    detachClient();
+    generation += 1;
+    const pending = detachClient();
     state = reduceConnection(state, "disconnected");
     lastStatus = { state: CONNECTION_STATES.idle, attempt: 0, lastError: null, subscribed: false };
     notify({ type: "state", state, status: lastStatus });
+    return pending || Promise.resolve();
   }
 
   return {

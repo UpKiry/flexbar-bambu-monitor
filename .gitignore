@@ -1,4 +1,7 @@
 node_modules
+.venv-pybambu/
+__pycache__/
+*.pyc
 .npm-cache
 logs
 .vscode

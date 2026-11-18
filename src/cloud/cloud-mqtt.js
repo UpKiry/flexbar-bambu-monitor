@@ -9,7 +9,17 @@
  * - 换成别的 MQTT 库或改用 WebSocket 不需要改上层逻辑。
  */
 
+const { performance } = require("node:perf_hooks");
+
 const TOPIC_PREFIX = "device";
+const MAX_REPORT_BYTES = 256 * 1024;
+// 共享于进程内所有客户端；切换设备或重建客户端不能绕过冷却。
+// 进程退出后记录会丢失，跨重启持久化需要另行实现。
+const pushallCooldowns = new Map();
+
+function validDeviceId(deviceId) {
+  return typeof deviceId === "string" && deviceId.length > 0 && !/[\/+\u0023\u0000-\u001f\u007f]/.test(deviceId);
+}
 
 /** 与 mqtt 库的错误码对齐，但只依赖数字常量，避免测试引入真实依赖。 */
 const MQTT_ERRORS = {
@@ -75,32 +85,33 @@ function createCloudMqttClient({
   logger,
   createClient = defaultCreateClient,
   now = () => Date.now(),
+  cooldownNow = () => performance.now(),
   random = Math.random,
   baseBackoffMs = 2_000,
   maxBackoffMs = 60_000,
   keepaliveSeconds = 60,
   pushallCooldownMs = 5 * 60_000,
+  closeTimeoutMs = 5_000,
 }) {
   let client = null;
   let state = CONNECTION_STATES.idle;
   let attempt = 0;
   let stopped = true;
   let reconnectTimer = null;
-  // null 表示从未请求过：用 0 会在时钟从 0 开始的测试里被误判成"冷却中"。
-  let lastPushallAt = null;
-  let pushallSequence = 0;
   let lastError = null;
   let reportHandler = null;
   let statusHandler = null;
   let subscribed = false;
+  // A pending close gates both automatic reconnect and manager replacement.
+  let closingPromise = null;
 
   function emitStatus(patch = {}) {
     const payload = { state, attempt, lastError, subscribed, ...patch };
     if (statusHandler) {
       try {
         statusHandler(payload);
-      } catch (error) {
-        logger?.warn?.(`MQTT 状态回调失败：${error?.message || error}`);
+      } catch {
+        logger?.warn?.("MQTT 状态回调失败");
       }
     }
   }
@@ -127,7 +138,16 @@ function createCloudMqttClient({
     logger?.warn?.(`云连接中断（${reason}），${Math.round(delay / 1000)} 秒后重试（第 ${attempt} 次）`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      connect();
+      if (closingPromise) {
+        closingPromise.then(() => connect(), () => {
+          if (!stopped) {
+            lastError = { kind: "network", message: "无法确认旧连接已关闭" };
+            setState(CONNECTION_STATES.failed);
+          }
+        });
+      } else {
+        connect();
+      }
     }, delay);
     if (typeof reconnectTimer.unref === "function") reconnectTimer.unref();
   }
@@ -142,21 +162,37 @@ function createCloudMqttClient({
     logger?.error?.(`云连接认证失败：${reason}`);
   }
 
-  function teardownClient() {
+  function teardownClient(alreadyClosed = false) {
     const current = client;
     client = null;
     subscribed = false;
-    if (!current) return;
+    if (!current) return closingPromise;
+    current.removeAllListeners?.();
+    let resolveClose;
+    let rejectClose;
+    const pending = new Promise((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+    const timer = setTimeout(() => rejectClose(new Error("无法确认旧连接已关闭")), closeTimeoutMs);
+    closingPromise = pending;
+    // A close event confirms the transport is closed. mqtt.js end callback is
+    // another confirmation after its cleanup completes.
+    current.once?.("close", resolveClose);
+    current.on?.("error", () => {});
     try {
-      current.removeAllListeners?.();
-      current.end?.(true);
+      current.end(true, (error) => error ? rejectClose(new Error("关闭云连接失败")) : resolveClose());
+      if (alreadyClosed) resolveClose();
     } catch {
-      // 连接已经坏了，忽略清理错误。
+      if (alreadyClosed) resolveClose();
+      else rejectClose(new Error("关闭云连接失败"));
     }
+    pending.then(() => {
+      clearTimeout(timer);
+      if (closingPromise === pending) closingPromise = null;
+    }, () => clearTimeout(timer));
+    return pending;
   }
 
   function handleMessage(topic, payload) {
-    if (topic !== reportTopic(deviceId)) return;
+    if (topic !== reportTopic(deviceId) || !Buffer.isBuffer(payload) || payload.length > MAX_REPORT_BYTES) return;
     let parsed;
     try {
       parsed = JSON.parse(payload.toString());
@@ -172,8 +208,8 @@ function createCloudMqttClient({
     if (!reportHandler) return;
     try {
       reportHandler({ raw, receivedAt: now() });
-    } catch (error) {
-      logger?.error?.(`处理云端报文失败：${error?.message || error}`);
+    } catch {
+      logger?.error?.("处理云端报文失败");
     }
   }
 
@@ -199,8 +235,8 @@ function createCloudMqttClient({
     let next;
     try {
       next = createClient(url, options);
-    } catch (error) {
-      lastError = { kind: "network", message: error?.message || "无法创建云连接" };
+    } catch {
+      lastError = { kind: "network", message: "无法创建云连接" };
       scheduleReconnect("create-failed");
       return;
     }
@@ -215,7 +251,7 @@ function createCloudMqttClient({
         settled = true;
         const rejected = granted?.some((entry) => entry.qos >= 128);
         if (error || rejected) {
-          const message = error?.message || "云端拒绝订阅";
+          const message = "云端状态订阅失败";
           lastError = { kind: "network", message };
           logger?.warn?.(`订阅云端状态失败：${message}`);
           teardownClient();
@@ -226,7 +262,7 @@ function createCloudMqttClient({
         attempt = 0;
         lastError = null;
         setState(CONNECTION_STATES.connected);
-        logger?.info?.(`已连接云端并订阅 ${topic}`);
+        logger?.info?.("已连接云端并订阅设备状态");
       };
       try {
         next.subscribe(topic, { qos: 0 }, onSubscribed);
@@ -242,7 +278,7 @@ function createCloudMqttClient({
     next.on("error", (error) => {
       if (client !== next || stopped) return;
       const code = error?.code;
-      lastError = { kind: code === MQTT_ERRORS.notAuthorized ? "unauthorized" : "network", message: error?.message || "云连接错误" };
+      lastError = { kind: code === MQTT_ERRORS.notAuthorized || code === MQTT_ERRORS.unauthorized ? "unauthorized" : "network", message: "云连接错误" };
       if (code === MQTT_ERRORS.notAuthorized || code === MQTT_ERRORS.unauthorized) {
         failAuth("云端拒绝了凭据，登录可能已失效");
       }
@@ -251,7 +287,7 @@ function createCloudMqttClient({
 
     next.on("close", () => {
       if (client !== next || stopped) return;
-      teardownClient();
+      teardownClient(true);
       if (state === CONNECTION_STATES.failed) return;
       scheduleReconnect("connection-closed");
     });
@@ -274,7 +310,7 @@ function createCloudMqttClient({
       statusHandler = handler;
     },
     start() {
-      if (!host || !username || !password || !deviceId) {
+      if (!host || !username || !password || !validDeviceId(deviceId)) {
         lastError = { kind: "config", message: "缺少云连接所需的地址、用户标识或令牌" };
         setState(CONNECTION_STATES.failed, { reason: "missing-config" });
         return false;
@@ -283,16 +319,24 @@ function createCloudMqttClient({
       stopped = false;
       attempt = 0;
       emitStatus();
-      connect();
+      if (closingPromise) {
+        closingPromise.then(() => connect(), () => {
+          if (!stopped) {
+            lastError = { kind: "network", message: "无法确认旧连接已关闭" };
+            setState(CONNECTION_STATES.failed);
+          }
+        });
+      } else connect();
       return true;
     },
     stop() {
       stopped = true;
       clearReconnectTimer();
-      teardownClient();
+      const closed = teardownClient();
       state = CONNECTION_STATES.idle;
       attempt = 0;
       emitStatus();
+      return closed || Promise.resolve();
     },
     /**
      * 主动请求完整状态。
@@ -300,33 +344,36 @@ function createCloudMqttClient({
      * 这是状态查询而不是打印控制；P1P 上每 5 分钟一次都可能造成卡顿，
      * 因此这里强制冷却，和重连、手动刷新共享限制。
      */
-    requestFullState({ force = false } = {}) {
+    requestFullState() {
       if (!client || state !== CONNECTION_STATES.connected) return { sent: false, reason: "not-connected" };
-      const stamp = now();
-      if (!force && lastPushallAt !== null && stamp - lastPushallAt < pushallCooldownMs) {
-        return { sent: false, reason: "cooldown", retryInMs: pushallCooldownMs - (stamp - lastPushallAt) };
+      const stamp = cooldownNow();
+      for (const [id, expiry] of pushallCooldowns) {
+        if (stamp >= expiry) pushallCooldowns.delete(id);
       }
-      const previousPushallAt = lastPushallAt;
-      const sequence = ++pushallSequence;
-      lastPushallAt = stamp;
-      let publishError = null;
-      function failed(error) {
-        if (!error) return;
-        publishError = error;
-        if (pushallSequence === sequence) lastPushallAt = previousPushallAt;
+      const expiry = pushallCooldowns.get(deviceId);
+      if (expiry !== undefined) {
+        return { sent: false, reason: "cooldown", retryInMs: expiry - stamp };
       }
+      // 一旦尝试发送便保守计入冷却：异常和异步错误都无法证明设备没有收到。
+      pushallCooldowns.set(deviceId, stamp + pushallCooldownMs);
+      let publishFailed = false;
       try {
         client.publish(
           requestTopic(deviceId),
           JSON.stringify({ pushing: { sequence_id: "0", command: "pushall", version: 1, push_target: 1 } }),
           { qos: 1 },
-          failed,
+          (error) => {
+            if (error) {
+              publishFailed = true;
+              logger?.warn?.("完整状态请求发送失败");
+            }
+          },
         );
-        if (publishError) return { sent: false, reason: publishError.message || "发送失败" };
+        // mqtt.js 接受发送请求不等于设备已收到或回应。
+        if (publishFailed) return { sent: false, reason: "publish-failed" };
         return { sent: true, reason: null };
-      } catch (error) {
-        failed(error);
-        return { sent: false, reason: error?.message || "发送失败" };
+      } catch {
+        return { sent: false, reason: "publish-failed" };
       }
     },
     status() {

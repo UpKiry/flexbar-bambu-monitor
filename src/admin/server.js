@@ -5,7 +5,6 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const { listRegions } = require("../cloud/region");
-const { redact } = require("../util/logger");
 const { createDiagnostics } = require("./diagnostics");
 const { openBrowser } = require("./open-browser");
 
@@ -286,7 +285,7 @@ function createAdminServer({
       const result = await runtime.actions[action](payload);
       return { httpStatus: 200, payload: { status: "success", action, result } };
     } catch (error) {
-      logger?.error?.(`浏览器后台操作 ${action} 失败：${redact(error?.message || error)}`);
+      logger?.error?.(`浏览器后台操作 ${action} 失败`);
       return { httpStatus: 500, payload: { status: "error", message: "操作失败" } };
     }
   }
@@ -319,7 +318,7 @@ function createAdminServer({
         try {
           sendJson(res, 200, await statusPayload());
         } catch (error) {
-          logger?.error?.(`浏览器后台读取状态失败：${redact(error?.message || error)}`);
+          logger?.error?.("浏览器后台读取状态失败");
           sendJson(res, 500, { status: "error", message: "读取状态失败" });
         }
         return;
@@ -391,7 +390,7 @@ function createAdminServer({
       });
       res.end(req.method === "HEAD" ? undefined : content);
     } catch (error) {
-      logger?.error?.(`浏览器后台页面文件读取失败：${redact(error?.message || error)}`);
+      logger?.error?.("浏览器后台页面文件读取失败");
       sendText(res, 500, "后台页面文件缺失，请重新安装插件。");
     }
   }
@@ -403,7 +402,7 @@ function createAdminServer({
     startPromise = new Promise((resolve, reject) => {
       const instance = http.createServer((req, res) => {
         handle(req, res).catch((error) => {
-          logger?.error?.(`浏览器后台请求处理失败：${redact(error?.message || error)}`);
+          logger?.error?.("浏览器后台请求处理失败");
           sendJson(res, 500, { status: "error", message: "后台请求失败" });
         });
       });
@@ -470,7 +469,7 @@ function createAdminServer({
     try {
       await start();
     } catch (error) {
-      logger?.error?.(`启动浏览器后台失败：${redact(error?.message || error)}`);
+      logger?.error?.("启动浏览器后台失败");
       return { status: "error", message: "无法启动浏览器后台，请查看插件日志" };
     }
 

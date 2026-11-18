@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createAuthService, STATES, normalizeSession } = require("../src/auth/auth-service");
-const { CloudApiError, ERROR_KINDS } = require("../src/cloud/cloud-api");
+const { CloudApi, CloudApiError, ERROR_KINDS } = require("../src/cloud/cloud-api");
 const { createCredentialStore, createMemoryBackend } = require("../src/auth/credential-store");
 
 function memoryStore({ available = true, reason = "" } = {}) {
@@ -44,6 +44,53 @@ test("password login walks signed-out → signing-in → signed-in", async () =>
   assert.equal(auth.getAccessToken(), "tok");
   assert.equal(auth.getUserId(), "42");
   assert.equal(auth.getRegion(), "global");
+});
+
+test("real cloud adapter login and user ID failure keep echoed token out of logs and diagnostics", async () => {
+  const secret = "FAKE-token-732009";
+  const events = [];
+  const logged = [];
+  const api = new CloudApi({
+    region: "global",
+    requestFn: async ({ url }) => url.endsWith("/login")
+      ? { status: 200, text: JSON.stringify({ accessToken: secret }) }
+      : { status: 500, text: JSON.stringify({ error: secret }) },
+    onRequest: (event) => events.push(event),
+  });
+  const auth = createAuthService({
+    createApi: () => api,
+    credentialStore: memoryStore(),
+    logger: { info: (m) => logged.push(m), warn: (m) => logged.push(m) },
+  });
+  const result = await auth.loginWithPassword({ region: "global", account: "a@b.c", password: "FAKE-password" });
+  assert.equal(result.status, "success");
+  assert.equal(auth.getAccessToken(), secret);
+  assert.equal(auth.getUserId(), null);
+  assert.ok(!JSON.stringify({ result, logged, events }).includes(secret));
+});
+
+test("login user ID failures and remote logout never log echoed secrets", async () => {
+  const secret = "FAKE-token-1345876";
+  const { auth, logged } = setup({
+    login: async () => ({ accessToken: secret }),
+    fetchUserId: async () => { throw new Error(`response ${secret}`); },
+    logout: async () => { throw new Error(`network ${secret}`); },
+  });
+  const result = await auth.loginWithPassword({ region: "global", account: "a@b.c", password: "FAKE-password" });
+  assert.equal(result.status, "success");
+  assert.equal(auth.getUserId(), null);
+  await auth.logout();
+  assert.ok(!JSON.stringify({ result, logged }).includes(secret));
+});
+
+test("auth errors use fixed messages even when injected errors echo credentials", async () => {
+  const secret = "FAKE-password-code-491127";
+  for (const error of [new Error(secret), new CloudApiError(ERROR_KINDS.invalidCredentials, secret)]) {
+    const { auth, logged } = setup({ login: async () => { throw error; } });
+    const result = await auth.loginWithPassword({ region: "global", account: "a@b.c", password: secret });
+    assert.equal(result.status, "failed");
+    assert.ok(!JSON.stringify({ result, logged, snapshot: auth.snapshot() }).includes(secret));
+  }
 });
 
 test("a failed login keeps the user in a retryable failed state", async () => {
@@ -373,6 +420,65 @@ test("cancelling during credential save discards the new session and stored cred
   assert.equal(auth.getAccessToken(), null);
   assert.equal(auth.snapshot().persisted, false);
   assert.equal(await store.load(), null);
+});
+
+test("old logout and invalidate clears cannot erase a newer login", async () => {
+  for (const action of ["logout", "invalidate"]) {
+    let stored = null;
+    let releaseClear;
+    let notifyClear;
+    const clearStarted = new Promise((resolve) => { notifyClear = resolve; });
+    const calls = [];
+    const store = {
+      async load() { return stored; },
+      async save(value) { calls.push("save"); stored = value; return { persisted: true }; },
+      async clear() {
+        calls.push("clear-start");
+        notifyClear();
+        await new Promise((resolve) => { releaseClear = resolve; });
+        stored = null;
+        calls.push("clear-end");
+      },
+    };
+    let sequence = 0;
+    const api = makeApi({ login: async () => ({ accessToken: ++sequence === 1 ? "old" : "new" }) });
+    const auth = createAuthService({ createApi: () => api, credentialStore: store, logger: {} });
+    await auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+    const clearing = auth[action]();
+    assert.equal(auth.getAccessToken(), null, `${action} clears the local session immediately`);
+    await clearStarted;
+    const newLogin = auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, ["save", "clear-start"]);
+    releaseClear();
+    await clearing;
+    assert.equal((await newLogin).status, "success");
+    assert.equal(auth.getAccessToken(), "new");
+    assert.equal(JSON.parse(stored).session.accessToken, "new");
+    assert.deepEqual(calls, ["save", "clear-start", "clear-end", "save"]);
+  }
+});
+
+test("failed old clear is reported without preventing a later login save", async () => {
+  let rejectClear;
+  let notifyClear;
+  let stored = null;
+  const clearStarted = new Promise((resolve) => { notifyClear = resolve; });
+  const store = {
+    async load() { return stored; },
+    async save(value) { stored = value; return { persisted: true }; },
+    clear() { notifyClear(); return new Promise((_resolve, reject) => { rejectClear = reject; }); },
+  };
+  const auth = createAuthService({ createApi: () => makeApi(), credentialStore: store, logger: {} });
+  await auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  const clearing = auth.logout();
+  await clearStarted;
+  const login = auth.loginWithPassword({ region: "global", account: "a@b.c", password: "pw" });
+  rejectClear(new Error("synthetic"));
+  await assert.rejects(clearing, /本地凭据删除失败/);
+  assert.equal((await login).status, "success");
+  assert.equal(auth.getAccessToken(), "tok");
+  assert.equal(JSON.parse(stored).session.accessToken, "tok");
 });
 
 test("cancelling a replacement login during save restores the previous credentials", async () => {

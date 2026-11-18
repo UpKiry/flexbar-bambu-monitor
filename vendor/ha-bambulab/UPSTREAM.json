@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/greghesp/ha-bambulab",
+  "commit": "e3c73139d443e9183ed2f804be30d2f2e53bbe66",
+  "sourcePath": "custom_components/bambu_lab/pybambu",
+  "excludedPaths": ["mock_data"],
+  "license": "MIT",
+  "purpose": "Pinned source snapshot for the experimental Python adapter; not yet used by the plugin runtime."
+}

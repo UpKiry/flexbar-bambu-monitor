@@ -39,6 +39,8 @@
         <div id="service-warning" class="banner error" role="alert" hidden></div>
         <div id="message" class="message" role="status" aria-live="polite" hidden></div>
 
+        <div class="card-columns">
+          <div class="card-column">
         <section class="card account-card">
           <div class="card-head">
             <h2>账号</h2>
@@ -90,56 +92,6 @@
           </form>
         </section>
 
-        <section class="card device-card">
-          <div class="card-head">
-            <h2>打印机</h2>
-            <div class="actions compact">
-              <button id="refresh-devices-btn" type="button" class="secondary">刷新设备</button>
-              <button id="test-connection-btn" type="button" class="secondary">测试连接</button>
-            </div>
-          </div>
-
-          <div id="device-empty" class="empty">登录后可以读取账号下绑定的打印机。</div>
-
-          <div id="device-panel" hidden>
-            <div class="field">
-              <label for="printer-select">要显示的打印机</label>
-              <select id="printer-select"></select>
-              <p id="device-hint" class="hint"></p>
-            </div>
-
-            <dl class="facts">
-              <div><dt>云端连接</dt><dd id="link-state">未连接</dd></div>
-              <div><dt>最近报文</dt><dd id="last-report">—</dd></div>
-              <div><dt>状态</dt><dd id="activity">—</dd></div>
-              <div><dt>任务</dt><dd id="task-name">—</dd></div>
-              <div><dt>进度</dt><dd id="progress-text">—</dd></div>
-              <div><dt>剩余</dt><dd id="remaining-text">—</dd></div>
-              <div><dt>喷嘴</dt><dd id="nozzle-text">—</dd></div>
-              <div><dt>热床</dt><dd id="bed-text">—</dd></div>
-              <div><dt>错误码</dt><dd id="error-code">—</dd></div>
-            </dl>
-            <p class="hint">最近报文是插件最近收到设备状态的时间，不代表设备当前仍在线。云端断连时，显示的状态可能是断连前的旧数据。</p>
-            <progress id="progress-bar" max="100" value="0" hidden></progress>
-
-            <div class="actions">
-              <button id="full-state-btn" type="button" class="secondary">请求完整状态</button>
-            </div>
-          </div>
-        </section>
-
-        <section class="card preview-card">
-          <div class="card-head">
-            <h2>Flexbar 按键预览</h2>
-            <span id="preview-view" class="badge">进度视图</span>
-          </div>
-          <div id="display-preview" class="preview tone-muted">
-            <div id="preview-title" class="preview-title">—</div>
-            <div id="preview-subtitle" class="preview-subtitle">—</div>
-          </div>
-          <p class="hint">只预览后台生成的展示模型，实际按键绘制仍以 Flexbar 为准。</p>
-        </section>
-
         <section class="card diagnostics-card">
           <div class="card-head">
             <h2>诊断</h2>
@@ -170,6 +122,55 @@
             <pre id="snapshot">—</pre>
           </details>
         </section>
+          </div>
+          <div class="card-column">
+        <section class="card device-card">
+          <div class="card-head">
+            <h2>打印机</h2>
+            <div class="actions compact">
+              <button id="refresh-devices-btn" type="button" class="secondary">刷新设备</button>
+              <button id="test-connection-btn" type="button" class="secondary">测试连接</button>
+            </div>
+          </div>
+
+          <div id="device-empty" class="empty">登录后可以读取账号下绑定的打印机。</div>
+
+          <div id="device-panel" hidden>
+            <div class="field">
+              <label for="printer-select">要显示的打印机</label>
+              <select id="printer-select"></select>
+              <p id="device-hint" class="hint"></p>
+            </div>
+
+            <dl class="facts">
+              <div><dt>云端连接</dt><dd id="link-state">未连接</dd></div>
+              <div><dt>最近报文</dt><dd id="last-report">—</dd></div>
+              <div><dt>状态</dt><dd id="activity">—</dd></div>
+              <div><dt>任务</dt><dd id="task-name">—</dd></div>
+              <div><dt>层数</dt><dd id="layer-text">—</dd></div>
+              <div><dt>进度</dt><dd id="progress-text">—</dd></div>
+              <div><dt>剩余</dt><dd id="remaining-text">—</dd></div>
+              <div><dt>喷嘴</dt><dd id="nozzle-text">—</dd></div>
+              <div><dt>热床</dt><dd id="bed-text">—</dd></div>
+              <div><dt>错误码</dt><dd id="error-code">—</dd></div>
+            </dl>
+            <p id="report-freshness" class="hint">尚未收到设备状态。</p>
+            <progress id="progress-bar" max="100" value="0" hidden></progress>
+            <h3>设备故障信息</h3>
+            <p id="hms-empty" class="hint">未知</p>
+            <ul id="hms-list" class="status-list"></ul>
+            <h3>AMS 耗材</h3>
+            <p id="ams-empty" class="hint">尚无 AMS 数据</p>
+            <ul id="ams-list" class="status-list"></ul>
+
+            <div class="actions">
+              <button id="full-state-btn" type="button" class="secondary">请求完整状态</button>
+            </div>
+          </div>
+        </section>
+
+          </div>
+        </div>
       </main>
 
       <footer class="footer">

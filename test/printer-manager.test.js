@@ -161,7 +161,8 @@ test("a throwing listener does not break dispatch", () => {
   manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
   created[0].emitReport({ raw: { gcode_state: "IDLE" } });
 
-  assert.ok(warnings.some((line) => line.includes("bad listener")));
+  assert.ok(warnings.includes("状态回调失败"));
+  assert.ok(warnings.every((line) => !line.includes("bad listener")));
   assert.ok(seen.includes("report"));
 });
 
@@ -189,4 +190,62 @@ test("callbacks retained by an old client cannot change a new printer", () => {
   assert.equal(manager.connected, false);
   assert.equal(manager.state.progressPercent, null);
   assert.equal(manager.printerId, "DEV2");
+});
+
+test("device switches and disconnect discard starts waiting for close", async () => {
+  const { manager, created } = setup();
+  const opts = { host: "h", port: 1, userId: "1", accessToken: "t" };
+  manager.selectPrinter("DEV1");
+  manager.connect(opts);
+  let close;
+  created[0].stop = () => new Promise((resolve) => { close = resolve; });
+  manager.selectPrinter("DEV2");
+  manager.connect(opts);
+  manager.selectPrinter("DEV3");
+  manager.connect(opts);
+  assert.equal(created.length, 1);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2);
+  assert.equal(created[1].options.deviceId, "DEV3");
+
+  let close2;
+  created[1].stop = () => new Promise((resolve) => { close2 = resolve; });
+  manager.selectPrinter("DEV4");
+  manager.connect(opts);
+  const stopped = manager.disconnect();
+  close2();
+  await stopped;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2);
+  assert.equal(manager.state.connection, "disconnected");
+});
+
+test("close timeout rejects and still blocks replacement", async () => {
+  const { factory, created } = makeFakeMqttFactory();
+  const manager = createPrinterManager({ createMqttClient: factory, closeTimeoutMs: 10 });
+  const opts = { host: "h", userId: "1", accessToken: "t" };
+  manager.selectPrinter("A");
+  manager.connect(opts);
+  created[0].stop = () => new Promise(() => {});
+  manager.selectPrinter("B");
+  manager.connect(opts);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(created.length, 1);
+  assert.equal(manager.status.state, "failed");
+  await assert.rejects(manager.disconnect(), /关闭/);
+});
+
+test("unconfirmed close prevents any replacement", async () => {
+  const { manager, created } = setup();
+  const opts = { host: "h", userId: "1", accessToken: "t" };
+  manager.selectPrinter("DEV1");
+  manager.connect(opts);
+  created[0].stop = () => Promise.reject(new Error("sensitive"));
+  manager.selectPrinter("DEV2");
+  manager.connect(opts);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 1);
+  assert.equal(manager.status.state, "failed");
+  assert.equal(manager.status.lastError.message, "无法确认旧连接已关闭");
 });

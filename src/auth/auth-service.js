@@ -1,5 +1,5 @@
-const { CloudApiError, ERROR_KINDS } = require("../cloud/cloud-api");
-const { resolveRegion, regionMismatchHint } = require("../cloud/region");
+const { CloudApiError, ERROR_KINDS, userMessageFor } = require("../cloud/cloud-api");
+const { resolveRegion } = require("../cloud/region");
 
 /**
  * 登录状态机（见 docs/云端监控设计方案.md §5.1）。
@@ -59,7 +59,13 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
   let pendingApi = null;
   let inFlight = false;
   let loginGeneration = 0;
-  let pendingPersist = null;
+  // 所有存储操作按发起顺序串行，旧清理不得越过新登录的写入。
+  let credentialQueue = Promise.resolve();
+  function queueCredential(operation) {
+    const result = credentialQueue.then(operation);
+    credentialQueue = result.catch(() => {});
+    return result;
+  }
 
   function snapshot() {
     return {
@@ -128,14 +134,13 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
   }
 
   async function persist(nextSession, generation, api) {
-    const previousRecord = sessionPersisted ? JSON.stringify({ [TOKEN_KEY]: session }) : null;
-    const operation = (async () => {
+    return queueCredential(async () => {
+      if (generation !== loginGeneration) return false;
+      const previousRecord = session.accessToken ? JSON.stringify({ [TOKEN_KEY]: session }) : null;
       const result = await credentialStore.save(JSON.stringify({ [TOKEN_KEY]: nextSession }));
       if (generation !== loginGeneration) {
-        if (result?.persisted === true) {
-          if (previousRecord) await credentialStore.save(previousRecord);
-          else await credentialStore.clear();
-        }
+        if (previousRecord) await credentialStore.save(previousRecord);
+        else await credentialStore.clear();
         return false;
       }
       session = nextSession;
@@ -147,46 +152,45 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       lastError = null;
       regionId = api.regionId;
       clearSecrets();
-      logger?.info?.(`Bambu 账号登录成功（区域：${api.regionLabel || api.regionId}）`);
+      logger?.info?.("Bambu 账号登录成功");
       return true;
-    })();
-    pendingPersist = operation;
-    try {
-      return await operation;
-    } finally {
-      if (pendingPersist === operation) pendingPersist = null;
-    }
+    });
   }
 
   async function hydrate() {
-    const stored = await credentialStore.load();
-    if (!stored) {
-      state = STATES.signedOut;
+    const generation = loginGeneration;
+    return queueCredential(async () => {
+      const stored = await credentialStore.load();
+      if (generation !== loginGeneration) return snapshot();
+      if (!stored) {
+        state = STATES.signedOut;
+        return snapshot();
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(stored);
+      } catch {
+        parsed = null;
+      }
+      const restored = normalizeSession(parsed?.[TOKEN_KEY] || parsed);
+      if (!restored) {
+        await credentialStore.clear();
+        if (generation !== loginGeneration) return snapshot();
+        state = STATES.signedOut;
+        return snapshot();
+      }
+      session = restored;
+      regionId = restored.region || regionId;
+      sessionPersisted = true;
+      if (isExpired()) {
+        state = STATES.expired;
+        lastError = { kind: ERROR_KINDS.unauthorized, message: "登录已失效，请重新登录" };
+        return snapshot();
+      }
+      state = STATES.signedIn;
+      lastError = null;
       return snapshot();
-    }
-    let parsed = null;
-    try {
-      parsed = JSON.parse(stored);
-    } catch {
-      parsed = null;
-    }
-    const restored = normalizeSession(parsed?.[TOKEN_KEY] || parsed);
-    if (!restored) {
-      await credentialStore.clear();
-      state = STATES.signedOut;
-      return snapshot();
-    }
-    session = restored;
-    regionId = restored.region || regionId;
-    sessionPersisted = true;
-    if (isExpired()) {
-      state = STATES.expired;
-      lastError = { kind: ERROR_KINDS.unauthorized, message: "登录已失效，请重新登录" };
-      return snapshot();
-    }
-    state = STATES.signedIn;
-    lastError = null;
-    return snapshot();
+    });
   }
 
   /**
@@ -290,7 +294,7 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       userId = await api.fetchUserId(loginResult.accessToken);
     } catch (error) {
       // 拿不到 uid 只影响云 MQTT，登录本身仍应成功。
-      logger?.warn?.(`读取用户标识失败：${error?.message || error}`);
+      logger?.warn?.("读取用户标识失败，云端监控暂不可用");
     }
     if (generation !== loginGeneration) return false;
     const nextSession = {
@@ -306,10 +310,9 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
 
   function handleAuthError(error, { account, api, retryCode = false }) {
     clearSecrets();
-    const kind = error instanceof CloudApiError ? error.kind : ERROR_KINDS.unknown;
-    const message = error instanceof CloudApiError
-      ? error.message
-      : (error?.message || "登录失败");
+    const kind = error instanceof CloudApiError && Object.values(ERROR_KINDS).includes(error.kind)
+      ? error.kind : ERROR_KINDS.unknown;
+    const message = userMessageFor(kind, null, regionId);
     if (kind === ERROR_KINDS.verificationRequired) {
       state = STATES.awaitingCode;
       pendingAccount = account;
@@ -328,9 +331,6 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
       logger?.warn?.(lastError.message);
       return { status: "unsupported", ...snapshot() };
     }
-    if (kind === ERROR_KINDS.unauthorized && /account|region/i.test(message)) {
-      return fail(ERROR_KINDS.regionMismatch, regionMismatchHint(api.regionId));
-    }
     return fail(kind, message);
   }
 
@@ -344,16 +344,24 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
     state = STATES.signedOut;
     lastError = null;
     clearSecrets();
-    if (pendingPersist) await pendingPersist.catch(() => {});
-    await credentialStore.clear();
+    // 入队必须在首次 await 前完成，确保之后的新会话写入排在清理之后。
+    const cleanup = queueCredential(() => credentialStore.clear());
+    let clearError = null;
+    try {
+      await cleanup;
+    } catch (error) {
+      clearError = error;
+      logger?.warn?.("本地凭据删除失败，旧凭据可能仍保留在系统安全存储中");
+    }
     if (revokeRemote && api && token) {
       // 服务端会话撤销是"尽力而为"：网络失败不能阻止本地退出登录。
       try {
         await api.logout(token);
       } catch (error) {
-        logger?.warn?.(`撤销服务端会话失败：${error?.message || error}`);
+        logger?.warn?.("撤销服务端会话失败");
       }
     }
+    if (clearError) throw new Error("本地凭据删除失败，旧凭据可能仍保留在系统安全存储中，请手动删除");
     return snapshot();
   }
 
@@ -364,8 +372,7 @@ function createAuthService({ createApi, credentialStore, logger, now = () => Dat
     sessionPersisted = false;
     state = STATES.expired;
     lastError = { kind: ERROR_KINDS.unauthorized, message: reason };
-    if (pendingPersist) await pendingPersist.catch(() => {});
-    await credentialStore.clear();
+    await queueCredential(() => credentialStore.clear());
     return snapshot();
   }
 

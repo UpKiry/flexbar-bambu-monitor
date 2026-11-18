@@ -62,7 +62,7 @@ async function startServer(t, overrides = {}) {
     staticDir: STATIC_DIR,
     token: TOKEN,
     openBrowserFn: overrides.openBrowserFn || (async () => ({ opened: true, reason: "" })),
-    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    logger: overrides.logger || { info: () => {}, warn: () => {}, error: () => {} },
   });
   const info = await server.start();
   t.after(() => server.stop());
@@ -85,6 +85,20 @@ function rawRequest(url, { method = "GET", headers = {}, body } = {}) {
     req.end();
   });
 }
+
+test("action exceptions never reach logs or responses", async (t) => {
+  const runtime = makeRuntime();
+  const logs = [];
+  runtime.actions.login = async () => { throw new Error("FAKE_SECRET_123"); };
+  const { baseUrl } = await startServer(t, { runtime, logger: { info() {}, error: (value) => logs.push(value) } });
+  const response = await fetch(`${baseUrl}/api/action`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ action: "login", payload: {} }),
+  });
+  assert.equal(response.status, 500);
+  assert.ok(!`${await response.text()} ${logs.join(" ")}`.includes("FAKE_SECRET_123"));
+});
 
 test("serves the admin page with security headers and no token", async (t) => {
   const { baseUrl } = await startServer(t);

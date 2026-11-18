@@ -98,9 +98,48 @@ test("stale data is marked instead of pretending to be live", () => {
   assert.equal(display.title, "数据已过期");
   assert.equal(display.stale, true);
   assert.equal(display.tone, "warning");
+  const reconnected = displayFor({ ...idleState, reportStale: true });
+  assert.equal(reconnected.title, "数据已过期");
+  assert.equal(reconnected.subtitle, "等待重新收到设备状态");
   for (const activity of ["idle", "paused", "finished", "failed"]) {
     assert.equal(displayFor({ ...idleState, activity }, { link: { state: "reconnecting" } }).title, "数据已过期");
   }
+});
+
+test("long silence marks data stale even while subscribed", () => {
+  const display = displayFor(idleState, { now: idleState.lastReportAt + 300_000 });
+  assert.equal(display.title, "数据已过期");
+  assert.equal(display.subtitle, "长时间未收到设备状态");
+});
+
+test("reported errors and HMS are visible regardless of activity", () => {
+  for (const activity of ["idle", "printing", "paused"]) {
+    assert.equal(displayFor({ ...idleState, activity, errorCode: "42" }).title, "设备报告故障");
+    assert.equal(displayFor({ ...idleState, activity, hms: [{ code: "1" }] }).tone, "critical");
+  }
+});
+
+test("AMS updates cannot make old task progress appear fresh", () => {
+  const state = {
+    ...idleState, activity: "printing", progressPercent: 12, remainingMinutes: null,
+    lastReportAt: 400_000, freshness: { fields: {
+      activity: { at: 1_000, stale: false }, progressPercent: { at: 1_000, stale: false },
+    } },
+  };
+  const display = displayFor(state, { now: 400_000 });
+  assert.equal(display.title, "数据已过期");
+});
+
+test("a new fault is visible even when other data are stale", () => {
+  const state = {
+    ...idleState, reportStale: true, printError: "123", errorCode: "123",
+    freshness: { fields: { printError: { at: 1_900, stale: false }, activity: { at: 1_000, stale: true } } },
+  };
+  const display = displayFor(state);
+  assert.equal(display.title, "设备报告故障");
+  assert.match(display.subtitle, /123/);
+  state.freshness.fields.printError.stale = true;
+  assert.equal(displayFor(state).title, "数据已过期");
 });
 
 test("paused, finished and failed states have distinct tones", () => {

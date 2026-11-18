@@ -1,0 +1,804 @@
+from __future__ import annotations
+from enum import (
+    Enum,
+)
+
+import base64
+import json
+import requests
+
+cloudscraper_available = False
+try:
+    import cloudscraper
+    cloudscraper_available = True
+except ImportError:
+    cloudscraper_available = False
+
+curl_available = False
+try:
+    from curl_cffi import requests as curl_requests
+    curl_available = True
+except ImportError:
+    curl_available = False
+
+class ConnectionMechanismEnum(Enum):
+    CLOUDSCRAPER = 1,
+    CURL_CFFI = 2,
+    REQUESTS = 3
+
+if cloudscraper_available:
+    CONNECTION_MECHANISM = ConnectionMechanismEnum.CLOUDSCRAPER
+else:
+    CONNECTION_MECHANISM = ConnectionMechanismEnum.REQUESTS
+
+from dataclasses import dataclass
+
+from .const import (
+     LOGGER,
+     USER_AGENT,
+     BambuUrl,
+     Printers
+)
+
+from .utils import get_Url
+
+IMPERSONATE_BROWSER='chrome'
+
+class CloudflareError(Exception):
+    def __init__(self):
+        super().__init__("Blocked by Cloudflare")
+        self.error_code = 403
+
+class CodeRequiredError(Exception):
+    def __init__(self):
+        super().__init__("Email code required")
+        self.error_code = 400
+
+class CodeExpiredError(Exception):
+    def __init__(self):
+        super().__init__("Email code expired")
+        self.error_code = 400
+
+class CodeIncorrectError(Exception):
+    def __init__(self):
+        super().__init__("Email code incorrect")
+        self.error_code = 400
+
+class TfaCodeRequiredError(Exception):
+    def __init__(self):
+        super().__init__("Two factor authentication code required")
+        self.error_code = 400
+
+class CurlUnavailableError(Exception):
+    def __init__(self):
+        super().__init__("curl library unavailable")
+        self.error_code = 400
+
+class CsrfError(Exception):
+    def __init__(self):
+        super().__init__("Blocked by CSRF cookie requirement")
+        self.error_code = 403
+
+class CsrfObtainError(Exception):
+    def __init__(self):
+        super().__init__("Not able to obtain CSRF cookie")
+        self.error_code = 403
+
+
+@dataclass
+class BambuCloud:
+  
+    def __init__(self, region: str, email: str, username: str, auth_token: str):
+        self._region = region
+        self._email = email
+        self._username = username
+        self._auth_token = auth_token
+        self._tfaKey = None
+        # MakerWorld endpoint -> the auth token it refused. See _get_makerworld_private.
+        self._makerworld_rejected: dict[BambuUrl, str] = {}
+
+    def _get_headers(self):
+        return {
+            'User-Agent': USER_AGENT,
+            'X-BBL-Client-Name': 'ha-bambulab',
+            'X-BBL-Client-Type': 'homeautomation',
+            'X-BBL-Client-Version': '01.00.00.00',
+            'X-BBL-Language': 'en-US',
+            'X-BBL-OS-Type': 'linux',
+            'X-BBL-OS-Version': '6.2.0',
+            'X-BBL-Agent-Version': '01.00.00.00',
+            'X-BBL-Executable-info': '{}',
+            'X-BBL-Agent-OS-Type': 'linux',
+            'accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Accept-Encoding': 'gzip, deflate'
+        }
+        # Orca/Bambu Studio also add this - need to work out what an appropriate ID is to put here:
+        # 'X-BBL-Device-ID': BBL_AUTH_UUID,
+        # Example: X-BBL-Device-ID: 370f9f43-c6fe-47d7-aec9-5fe5ef7e7673
+
+    def _get_headers_with_auth_token(self) -> dict:
+        if CONNECTION_MECHANISM == ConnectionMechanismEnum.CURL_CFFI:
+            headers = {}
+        else:
+            headers = self._get_headers()
+        headers['Authorization'] = f"Bearer {self._auth_token}"
+        return headers
+
+    def _test_response(self, response, return400=False):
+        # Check specifically for cloudflare block
+        if response.status_code == 403 and 'cloudflare' in response.text:
+            LOGGER.error("BLOCKED BY CLOUDFLARE")
+            raise CloudflareError()
+        elif response.status_code == 403 and 'missing_cookie' in response.text:
+            # bambulab.com (the website host) requires a CSRF cookie that the API host
+            # never issues. Callers can recover by falling back to code login.
+            LOGGER.error("BLOCKED BY CSRF COOKIE REQUIREMENT")
+            raise CsrfError()
+        elif response.status_code == 429 and 'cloudflare' in response.text:
+            LOGGER.error("TEMPORARY 429 BLOCK BY CLOUDFLARE")
+            raise CloudflareError(response.status_code, response.text)
+        elif response.status_code == 400 and not return400:
+            LOGGER.error(f"Connection failed with error code: {response.status_code}")
+            LOGGER.debug(f"Response: '{response.text}'")
+            raise PermissionError(response.status_code, response.text)
+        elif response.status_code > 400:
+            LOGGER.error(f"Connection failed with error code: {response.status_code}")
+            LOGGER.debug(f"Response: '{response.text}'")
+            raise PermissionError(response.status_code, response.text)
+        
+        LOGGER.debug(f"Response: {response.status_code}")
+
+    def _get(self, urlenum: BambuUrl, suffix: str = ""):
+        try:
+            url = get_Url(urlenum, self._region) + suffix
+            headers=self._get_headers_with_auth_token()
+            if CONNECTION_MECHANISM == ConnectionMechanismEnum.CURL_CFFI:
+                if not curl_available:
+                    LOGGER.debug(f"Curl library is unavailable.")
+                    raise CurlUnavailableError()
+                response = curl_requests.get(url, headers=headers, timeout=10, impersonate=IMPERSONATE_BROWSER)
+            elif CONNECTION_MECHANISM == ConnectionMechanismEnum.CLOUDSCRAPER:
+                if len(headers) == 0:
+                    headers = self._get_headers()
+                scraper = cloudscraper.create_scraper()
+                response = scraper.get(url, headers=headers, timeout=10)
+            elif CONNECTION_MECHANISM == ConnectionMechanismEnum.REQUESTS:
+                if len(headers) == 0:
+                    headers = self._get_headers()
+                response = requests.get(url, headers=headers, timeout=10)
+            else:
+                raise NotImplementedError()
+        except Exception as e:
+            LOGGER.error(f"Connection to Bambu Cloud failed: {e}")
+            raise e
+
+        self._test_response(response)
+
+        return response
+
+
+    def _post(self, urlenum: BambuUrl, json: str, headers={}, return400=False):
+        url = get_Url(urlenum, self._region)
+        if CONNECTION_MECHANISM == ConnectionMechanismEnum.CURL_CFFI:
+            if not curl_available:
+                LOGGER.debug(f"Curl library is unavailable.")
+                raise CurlUnavailableError()
+            response = curl_requests.post(url, headers=headers, json=json, timeout=10, impersonate=IMPERSONATE_BROWSER)
+        elif CONNECTION_MECHANISM == ConnectionMechanismEnum.CLOUDSCRAPER:
+            if len(headers) == 0:
+                headers = self._get_headers()
+            scraper = cloudscraper.create_scraper()
+            response = scraper.post(url, headers=headers, json=json, timeout=10)
+        elif CONNECTION_MECHANISM == ConnectionMechanismEnum.REQUESTS:
+            if len(headers) == 0:
+                headers = self._get_headers()
+            response = requests.post(url, headers=headers, json=json, timeout=10)
+        else:
+            raise NotImplementedError()
+
+        self._test_response(response, return400)
+        
+        return response
+
+    def _get_authentication_token(self) -> str:
+        LOGGER.debug("Getting accessToken from Bambu Cloud")
+
+        # First we need to find out how Bambu wants us to login.
+        data = {
+            "account": self._email,
+            "password": self._password,
+            "apiError": ""
+        }
+
+        response = self._post(BambuUrl.LOGIN, json=data)
+
+        auth_json = response.json()
+        accessToken = auth_json.get('accessToken', '')
+        if accessToken != '':
+            # We were provided the accessToken directly.
+            return accessToken
+        
+        loginType = auth_json.get("loginType", None)
+        if loginType is None:
+            LOGGER.error(f"loginType not present")
+            LOGGER.error(f"Response not understood: '{response.text}'")
+            return ValueError(0) # FIXME
+        elif loginType == 'verifyCode':
+            LOGGER.debug(f"Received verifyCode response")
+            raise CodeRequiredError()
+        elif loginType == 'tfa':
+            # Store the tfaKey for later use
+            LOGGER.debug(f"Received tfa response")
+            self._tfaKey = auth_json.get("tfaKey")
+            raise TfaCodeRequiredError()
+        else:
+            LOGGER.debug(f"Did not understand json. loginType = '{loginType}'")
+            LOGGER.error(f"Response not understood: '{response.text}'")
+            return ValueError(1) # FIXME
+        
+    def _get_new_code(self):
+        if '@' in self._email:
+            self._get_email_verification_code()
+        else:
+            self._get_sms_verification_code()
+    
+    def _get_email_verification_code(self):
+        # Send the verification code request
+        data = {
+            "email": self._email,
+            "type": "codeLogin"
+        }
+
+        LOGGER.debug("Requesting email verification code")
+        self._post(BambuUrl.EMAIL_CODE, json=data)
+        LOGGER.debug("Verification code requested successfully.")
+
+    def _get_sms_verification_code(self):
+        # Send the verification code request
+        data = {
+            "phone": self._email,
+            "type": "codeLogin"
+        }
+
+        LOGGER.debug("Requesting SMS verification code")
+        self._post(BambuUrl.SMS_CODE, json=data)
+        LOGGER.debug("Verification code requested successfully.")
+
+    def _get_authentication_token_with_verification_code(self, code) -> dict:
+        LOGGER.debug("Attempting to connect with provided verification code.")
+        data = {
+            "account": self._email,
+            "code": code
+        }
+
+        response = self._post(BambuUrl.LOGIN, json=data, return400=True)
+        status_code = response.status_code
+
+        if status_code == 200:
+            LOGGER.debug("Authentication successful.")
+        elif status_code == 400:
+            LOGGER.debug(f"Received response: {response.json()}")           
+            if response.json()['code'] == 1:
+                # Code has expired. Request a new one.
+                self._get_new_code()
+                raise CodeExpiredError()
+            elif response.json()['code'] == 2:
+                # Code was incorrect. Let the user try again.
+                raise CodeIncorrectError()
+            else:
+                LOGGER.error(f"Response not understood: '{response.json()}'")
+                raise ValueError(response.json()['code'])
+
+        return response.json()['accessToken']
+    
+    def _get_authentication_token_with_2fa_code(self, code: str) -> dict:
+        LOGGER.debug("Attempting to connect with provided 2FA code.")
+
+        data = {
+            "tfaKey": self._tfaKey,
+            "tfaCode": code
+        }
+
+        try:
+            csrf_response = self._get(BambuUrl.CSRF)
+        except PermissionError as e:
+            # This endpoint is a website route that has already moved once. Report it as a
+            # CSRF failure so the config flow can fall back to code login.
+            LOGGER.error(f"Failed to retrieve CSRF token: {e.args[0] if e.args else e}")
+            raise CsrfObtainError() from e
+
+        if csrf_response.status_code != 204 or csrf_response.cookies.get('bbl_csrf_token') is None:
+            LOGGER.error(f"Failed to retrieve CSRF token: {csrf_response.status_code}")
+            raise CsrfObtainError
+
+        headers = self._get_headers()
+        headers['x-bbl-csrf-token'] = csrf_response.cookies.get('bbl_csrf_token')
+        headers['Cookie'] = f"bbl_csrf_token={csrf_response.cookies.get('bbl_csrf_token')}"
+
+        response = self._post(BambuUrl.TFA_LOGIN, headers=headers, json=data, return400=True)
+        if response.status_code == 400:
+            LOGGER.debug(f"Response: '{response.text}'")
+            if 'Incorrect code' in response.text:
+                raise CodeIncorrectError()
+            raise PermissionError(response.status_code, response.text)
+
+        LOGGER.debug(f"Response: {response.status_code}")
+        if response.status_code == 200:
+            LOGGER.debug("Authentication successful.")
+
+        cookies = response.cookies.get_dict()
+        token_from_tfa = cookies.get("token")
+        #LOGGER.debug(f"token_from_tfa: {token_from_tfa}")
+
+        return token_from_tfa
+    
+    def _get_username_from_authentication_token(self) -> str:
+        LOGGER.debug("Trying to get username from authentication token.")
+        # User name is in 2nd portion of the auth token (delimited with periods)
+        username = None
+        tokens = self._auth_token.split(".")
+        if len(tokens) != 3:
+            LOGGER.debug("Received authToken is not a JWT.")
+            LOGGER.debug("Trying to use preference API to retrieve username instead")
+            response = self._get(BambuUrl.PREFERENCE)
+            if response is not None:
+                uid = response.json().get('uid', None)
+                if uid is not None:
+                    username = f"u_{uid}"
+                    LOGGER.debug(f"Found user_id of {username[:7]}xxxxx")
+        else:
+            LOGGER.debug("Authentication token looks to be a JWT")
+            try:
+                b64_string = self._auth_token.split(".")[1]
+                # String must be multiples of 4 chars in length. For decode pad with = character
+                b64_string += "=" * ((4 - len(b64_string) % 4) % 4)
+                jsonAuthToken = json.loads(base64.b64decode(b64_string))
+                # Gives json payload with "username":"u_<digits>" within it
+                username = jsonAuthToken.get('username', None)
+            except:
+                LOGGER.debug("Unable to decode authToken to json to retrieve username.")
+
+        if username is None:
+            LOGGER.debug(f"Unable to decode authToken to retrieve username. AuthToken = {self._auth_token[:10]}xxxxx")
+
+        return username
+    
+    # Retrieves json description of devices in the form:
+    # {
+    #     'message': 'success',
+    #     'code': None,
+    #     'error': None,
+    #     'devices': [
+    #         {
+    #             'dev_id': 'REDACTED',
+    #             'name': 'Bambu P1S',
+    #             'online': True,
+    #             'print_status': 'SUCCESS',
+    #             'dev_model_name': 'C12',
+    #             'dev_product_name': 'P1S',
+    #             'dev_access_code': 'REDACTED',
+    #             'nozzle_diameter': 0.4
+    #         },
+    #         {
+    #             'dev_id': 'REDACTED',
+    #             'name': 'Bambu P1P',
+    #             'online': True,
+    #             'print_status': 'RUNNING',
+    #             'dev_model_name': 'C11',
+    #             'dev_product_name': 'P1P',
+    #             'dev_access_code': 'REDACTED',
+    #             'nozzle_diameter': 0.4
+    #         },
+    #         {
+    #             'dev_id': 'REDACTED',
+    #             'name': 'Bambu X1C',
+    #             'online': True,
+    #             'print_status': 'RUNNING',
+    #             'dev_model_name': 'BL-P001',
+    #             'dev_product_name': 'X1 Carbon',
+    #             'dev_access_code': 'REDACTED',
+    #             'nozzle_diameter': 0.4
+    #         }
+    #     ]
+    # }
+    
+    def test_authentication(self, region: str, email: str, username: str, auth_token: str) -> bool:
+        self._region = region
+        self._email = email
+        self._username = username
+        self._auth_token = auth_token
+        result = self.get_device_list()
+        return False if result is None else True
+
+    def login(self, region: str, email: str, password: str) -> str:
+        self._region = region
+        self._email = email
+        self._password = password
+
+        result = self._get_authentication_token()
+        self._auth_token = result
+        self._username = self._get_username_from_authentication_token()
+        
+    def login_with_verification_code(self, code: str):
+        result = self._get_authentication_token_with_verification_code(code)
+        self._auth_token = result
+        self._username = self._get_username_from_authentication_token()
+
+    def login_with_2fa_code(self, code: str):
+        result = self._get_authentication_token_with_2fa_code(code)
+        self._auth_token = result
+        self._username = self._get_username_from_authentication_token()
+
+    def request_new_code(self):
+        self._get_new_code()
+
+    def get_device_list(self) -> dict:
+        LOGGER.debug("Getting device list from Bambu Cloud")
+        try:
+            response = self._get(BambuUrl.BIND)
+        except:
+            return None
+        return response.json()['devices']
+
+    # The slicer settings are of the following form:
+    #
+    # {
+    #     "message": "success",
+    #     "code": null,
+    #     "error": null,
+    #     "print": {
+    #         "public": [
+    #             {
+    #                 "setting_id": "GP004",
+    #                 "version": "01.09.00.15",
+    #                 "name": "0.20mm Standard @BBL X1C",
+    #                 "update_time": "2024-07-04 11:27:08",
+    #                 "nickname": null
+    #             },
+    #             ...
+    #         }
+    #         "private": []
+    #     },
+    #     "printer": {
+    #         "public": [
+    #             {
+    #                 "setting_id": "GM001",
+    #                 "version": "01.09.00.15",
+    #                 "name": "Bambu Lab X1 Carbon 0.4 nozzle",
+    #                 "update_time": "2024-07-04 11:25:07",
+    #                 "nickname": null
+    #             },
+    #             ...
+    #         ],
+    #         "private": []
+    #     },
+    #     "filament": {
+    #         "public": [
+    #             {
+    #                 "setting_id": "GFSA01",
+    #                 "version": "01.09.00.15",
+    #                 "name": "Bambu PLA Matte @BBL X1C",
+    #                 "update_time": "2024-07-04 11:29:21",
+    #                 "nickname": null,
+    #                 "filament_id": "GFA01"
+    #             },
+    #             ...
+    #         ],
+    #         "private": [
+    #             {
+    #                 "setting_id": "PFUS46ea5c221cabe5",
+    #                 "version": "1.9.0.14",
+    #                 "name": "Fillamentum PLA Extrafill @Bambu Lab X1 Carbon 0.4 nozzle",
+    #                 "update_time": "2024-07-10 06:48:17",
+    #                 "base_id": null,
+    #                 "filament_id": "Pc628b24",
+    #                 "filament_type": "PLA",
+    #                 "filament_is_support": "0",
+    #                 "nozzle_temperature": [
+    #                     190,
+    #                     240
+    #                 ],
+    #                 "nozzle_hrc": "3",
+    #                 "filament_vendor": "Fillamentum"
+    #             },
+    #             ...
+    #         ]
+    #     },
+    #     "settings": {}
+    # }
+
+    def get_slicer_settings(self) -> dict:
+        LOGGER.debug("Getting slicer settings from Bambu Cloud")
+        try:
+            response = self._get(BambuUrl.SLICER_SETTINGS)
+        except:
+            return None
+        return response.json()
+
+    # The filament inventory ("Filament Manager") is of the following form:
+    #
+    # {
+    #     "hits": [
+    #         {
+    #             "id": 6915055,
+    #             "createType": "ams",
+    #             "filamentVendor": "Bambu Lab",
+    #             "filamentType": "PLA",
+    #             "filamentName": "PLA Basic",
+    #             "filamentId": "GFA00",
+    #             "RFID": "REDACTED",
+    #             "color": "#FFFFFFFF",
+    #             "colorType": 2,
+    #             "colors": ["#FFFFFFFF"],
+    #             "netWeight": 931,
+    #             "totalNetWeight": 1000,
+    #             "note": "",
+    #             "createdAt": 1780424283,
+    #             "updatedAt": 1780424283,
+    #             "status": 0,
+    #             "isSupport": false,
+    #             "trayIdName": "A00-W01",
+    #             "category": "PLA"
+    #         },
+    #         ...
+    #     ]
+    # }
+
+    def get_filaments(self) -> dict:
+        LOGGER.debug("Getting filament inventory from Bambu Cloud")
+        try:
+            response = self._get(BambuUrl.FILAMENTS)
+        except:
+            return None
+        return response.json()
+
+    # The task list is of the following form with a 'hits' array with typical 20 entries.
+    #
+    # "total": 531,
+    # "hits": [
+    #     {
+    #     "id": 35237965,
+    #     "designId": 0,
+    #     "designTitle": "",
+    #     "instanceId": 0,
+    #     "modelId": "REDACTED",
+    #     "title": "REDACTED",
+    #     "cover": "REDACTED",
+    #     "status": 4,
+    #     "feedbackStatus": 0,
+    #     "startTime": "2023-12-21T19:02:16Z",
+    #     "endTime": "2023-12-21T19:02:35Z",
+    #     "weight": 34.62,
+    #     "length": 1161,
+    #     "costTime": 10346,
+    #     "profileId": 35276233,
+    #     "plateIndex": 1,
+    #     "plateName": "",
+    #     "deviceId": "REDACTED",
+    #     "amsDetailMapping": [
+    #         {
+    #         "ams": 4,
+    #         "sourceColor": "F4D976FF",
+    #         "targetColor": "F4D976FF",
+    #         "filamentId": "GFL99",
+    #         "filamentType": "PLA",
+    #         "targetFilamentType": "",
+    #         "weight": 34.62
+    #         }
+    #     ],
+    #     "mode": "cloud_file",
+    #     "isPublicProfile": false,
+    #     "isPrintable": true,
+    #     "deviceModel": "P1P",
+    #     "deviceName": "Bambu P1P",
+    #     "bedType": "textured_plate"
+    #     },
+
+    def get_tasklist(self) -> dict:
+        LOGGER.debug("Getting full task list from Bambu Cloud")
+        try:
+            response = self._get(BambuUrl.TASKS)
+        except:
+            return None
+        return response.json()
+
+    # Returns a list of projects for the account.
+    #
+    # {
+    # "message": "success",
+    # "code": null,
+    # "error": null,
+    # "projects": [
+    #     {
+    #     "project_id": "164995388",
+    #     "user_id": "16xxxxx50",
+    #     "model_id": "US48e2103d939bf8",
+    #     "status": "ACTIVE",
+    #     "name": "Alcohol_Marker_Storage_for_Copic,_Ohuhu_and_the_like",
+    #     "content": "{'printed_plates': [{'plate': 1}]}",
+    #     "create_time": "2024-11-17 06:12:33",
+    #     "update_time": "2024-11-17 06:12:40"
+    #     },
+    #     ...
+    #
+    def get_projects(self) -> dict:
+        LOGGER.debug("Getting projects list from Bambu Cloud")
+        try:
+            response = self._get(BambuUrl.PROJECTS)
+        except:
+            return None
+        return response.json()
+
+    def get_latest_task_for_printer(self, deviceId: str) -> dict:
+        LOGGER.debug(f"Getting latest task for printer from Bambu Cloud")
+        try:
+            data = self.get_tasklist_for_printer(deviceId)
+            if len(data) != 0:
+                return data[0]
+            LOGGER.debug("No tasks found for printer")
+            return None
+        except:
+            return None
+
+    def get_tasklist_for_printer(self, deviceId: str) -> dict:
+        LOGGER.debug(f"Getting full task list for printer from Bambu Cloud")
+        tasks = []
+        data = self.get_tasklist()
+        for task in data['hits']:
+            if task['deviceId'] == deviceId:
+                tasks.append(task)
+        return tasks
+
+    # The account's own MakerWorld profile. One authenticated response carries
+    # everything: the counts below plus the points balance ('point') and the
+    # boosts the account's models have received ('boostGained'). Verified shape
+    # (fields we don't use omitted):
+    #
+    # {
+    #     "uid": 1234567890,
+    #     "name": "Some Creator",
+    #     "handle": "somecreator",
+    #     "point": 8400,
+    #     "pointRegular": 8400,
+    #     "pointExclusive": 0,
+    #     "boost": 2,                     <- boost tokens available to give out
+    #     "boostGained": 210,             <- boosts this account's models received
+    #     "fanCount": 150,
+    #     "followCount": 8,
+    #     "likeCount": 1800,
+    #     "collectionCount": 3400,
+    #     "downloadCount": 12800,         <- agrees with nothing MakerWorld shows
+    #     "personal": { "userLevel": { "level": 9 } },
+    #     "MWCount": {
+    #         "myDesignDownloadCount": 4200,
+    #         "myInstanceDownloadCount": 5100,
+    #         "designCount": 12,
+    #         "myDesignPrintCount": 3100,
+    #         "myInstancePrintCount": 2900
+    #     }
+    # }
+    #
+    # The public profile at USER_PROFILE returns the same counts for any uid but
+    # no points and no boosts, so it only serves as a fallback.
+
+    def get_makerworld_profile(self, uid: str | None = None) -> dict:
+        """Retrieve the account's MakerWorld profile."""
+        LOGGER.debug("Getting MakerWorld profile from Bambu Cloud")
+        try:
+            return self._get(BambuUrl.MY_PROFILE).json()
+        except Exception as e:
+            LOGGER.debug(f"Failed to retrieve own MakerWorld profile: {e}")
+
+        if uid is None:
+            return None
+
+        LOGGER.debug("Falling back to the public MakerWorld profile")
+        try:
+            return self._get(BambuUrl.USER_PROFILE, suffix=f"/{uid}").json()
+        except Exception as e:
+            LOGGER.debug(f"Failed to retrieve public MakerWorld profile: {e}")
+            return None
+
+    # The points ledger. Only the totals in the response header are of interest;
+    # 'total' is the number of transactions, not a points figure. Verified shape:
+    #
+    # {
+    #     "total": 640,
+    #     "totalIncome": 15000,
+    #     "totalExpense": 6600,
+    #     "totalRegularIncome": 15000,
+    #     "totalRegularExpense": 6600,
+    #     "totalExclusiveIncome": 0,
+    #     "totalExclusiveExpense": 0,
+    #     "hits": [ ... one transaction per the limit in the url ... ]
+    # }
+    #
+    # MakerWorld shows income minus expense as the points balance.
+
+    def get_makerworld_points(self) -> dict:
+        """Retrieve the MakerWorld points ledger totals for the account."""
+        LOGGER.debug("Getting MakerWorld points from Bambu Cloud")
+        return self._get_makerworld_private(BambuUrl.POINT_BILL, "MakerWorld points")
+
+    def _get_makerworld_private(self, urlenum: BambuUrl, what: str) -> dict | None:
+        """Best effort GET of an account private MakerWorld endpoint.
+
+        Once the endpoint refuses the current token, it isn't asked again until
+        the token changes: polling it anyway only produces a 401 per poll, which
+        Bambu has flagged as abnormal traffic (#2270)."""
+        if self._makerworld_rejected.get(urlenum) == self._auth_token:
+            return None
+        try:
+            response = self._get(urlenum)
+            return response.json()
+        except PermissionError as e:
+            if e.args and e.args[0] in (401, 403):
+                LOGGER.debug(f"{what} refused for this token; not polling it again until re-login")
+                self._makerworld_rejected[urlenum] = self._auth_token
+            else:
+                LOGGER.debug(f"Failed to retrieve {what}: {e}")
+            return None
+        except Exception as e:
+            LOGGER.debug(f"Failed to retrieve {what}: {e}")
+            return None
+
+    # Boost tokens. Verified shape:
+    #
+    # {
+    #     "availableTotal": 2,
+    #     "usedTotal": 40,
+    #     "expiredTotal": 1,
+    #     "total": 2,
+    #     "hits": []
+    # }
+
+    def get_makerworld_boosts(self) -> dict:
+        """Retrieve the account's boost token counts."""
+        LOGGER.debug("Getting MakerWorld boost tokens from Bambu Cloud")
+        return self._get_makerworld_private(BambuUrl.BOOST_RIGHT, "MakerWorld boost tokens")
+
+    def get_uid(self) -> str | None:
+        """The numeric account id, which doubles as the MakerWorld profile id."""
+        # The cloud login already stores this as the mqtt username in 'u_<uid>' form.
+        if self._username.startswith("u_") and self._username[2:].isdigit():
+            return self._username[2:]
+
+        LOGGER.debug("Username is not in u_<uid> form. Falling back to the preference API.")
+        try:
+            response = self._get(BambuUrl.PREFERENCE)
+            uid = response.json().get('uid', None)
+        except Exception as e:
+            LOGGER.debug(f"Failed to retrieve uid from preference API: {e}")
+            return None
+        return str(uid) if uid is not None else None
+
+    def get_device_type_from_device_product_name(self, device_product_name: str):
+        if device_product_name == "X1 Carbon":
+            return Printers.X1C
+        return device_product_name.replace(" ", "").upper()
+
+    def download(self, url: str) -> bytearray:
+        LOGGER.debug(f"Downloading cover image: {url}")
+        try:
+            # This is just a standard download from an unauthenticated end point.
+            response = requests.get(url, headers={'User-Agent': USER_AGENT})
+        except:
+            return None
+        return response.content
+
+    @property
+    def username(self):
+        return self._username
+    
+    @property
+    def auth_token(self):
+        return self._auth_token
+    
+    @property
+    def bambu_connected(self) -> bool:
+        return self._auth_token != "" and self._auth_token != None
+    
+    @property
+    def cloud_mqtt_host(self):
+        return "cn.mqtt.bambulab.com" if self._region == "China" else "us.mqtt.bambulab.com"

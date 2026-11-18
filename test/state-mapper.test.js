@@ -63,6 +63,14 @@ test("error codes keep the raw code and ignore zero", () => {
   assert.equal(mapErrorCode({}), null);
 });
 
+test("error channels distinguish missing, explicit unknown, clear and raw codes", () => {
+  assert.deepEqual(mapReport({}), {});
+  assert.deepEqual(mapReport({ print_error: null, mc_print_error_code: 0 }), { printError: null, printErrorCode: 0 });
+  assert.deepEqual(mapReport({ print_error: "0", mc_print_error_code: "0x0300" }), { printError: 0, printErrorCode: "0x0300" });
+  assert.deepEqual(mapReport({ print_error: false, mc_print_error_code: {} }), {});
+  assert.equal(mapErrorCode({ print_error: 0, mc_print_error_code: "45" }), "45");
+});
+
 test("mapReport only returns fields present in the report", () => {
   const patch = mapReport({ mc_percent: 55, nozzle_temper: 210.4 });
   assert.deepEqual(patch, { progressPercent: 55, nozzleCurrent: 210.4 });
@@ -88,9 +96,42 @@ test("mapReport maps the full idle sample", () => {
   assert.equal(patch.activity, "idle");
   assert.equal(patch.progressPercent, 0);
   assert.equal(patch.taskName, null);
-  assert.equal(patch.errorCode, null);
+  assert.equal(patch.printError, 0);
+  assert.equal(patch.printErrorCode, 0);
   assert.deepEqual(patch.hms, []);
   assert.equal(patch.bedCurrent, 25);
+});
+
+test("AMS maps only reported fields and keeps raw status and zero", () => {
+  assert.deepEqual(mapReport({ ams: { tray_now: "0", ams: [{ id: "0", tray: [
+    { id: "1", tray_color: "FF00AAFF", tray_type: "PLA", remain: 0, state: 0 },
+    { id: "2", remain: -1, tray_color: "invalid", tray_type: "" },
+  ] }] }, ams_status: 0 }), {
+    ams: { rawTrayNow: "0", current: { unitId: "0", slotId: "0" }, units: [{ id: "0", slots: [
+      { id: "1", color: "FF00AAFF", material: "PLA", remaining: 0, rawState: 0 },
+      { id: "2", remaining: null, material: null },
+    ] }] }, amsStatus: 0,
+  });
+  assert.deepEqual(mapReport({ ams: { tray_now: "254" } }).ams, { rawTrayNow: "254", current: null });
+  assert.deepEqual(mapReport({ ams: { tray_now: 255 } }).ams, { rawTrayNow: 255, current: null });
+  assert.deepEqual(mapReport({ ams: { tray_now: 128 } }).ams.current, { unitId: "128", slotId: "0" });
+  assert.deepEqual(mapReport({ ams: { tray_now: 5 } }).ams.current, { unitId: "1", slotId: "1" });
+  assert.deepEqual(mapReport({ ams: { ams: [{ id: "bad" }] } }), {});
+});
+
+test("AMS null lists remain distinct from missing and empty arrays", () => {
+  assert.deepEqual(mapReport({ ams: { ams: null, tray_now: "1" } }).ams, {
+    units: null, rawTrayNow: "1", current: { unitId: "0", slotId: "1" },
+  });
+  assert.deepEqual(mapReport({ ams: { ams: [] } }).ams, { units: [] });
+  assert.deepEqual(mapReport({ ams: { ams: [{ id: "0", tray: null }] } }).ams, { units: [{ id: "0", slots: null }] });
+  assert.deepEqual(mapReport({ ams: { ams: [{ id: "0", tray: [] }, { id: "1" }] } }).ams, { units: [{ id: "0", slots: [] }, { id: "1" }] });
+});
+
+test("reported AMS ids survive without inferred slot properties", () => {
+  assert.deepEqual(mapReport({ ams: { ams: [{ id: "0", tray: [{ id: "1" }] }, { id: "2" }] } }), {
+    ams: { units: [{ id: "0", slots: [{ id: "1" }] }, { id: "2" }] },
+  });
 });
 
 test("mapReport tolerates junk input", () => {

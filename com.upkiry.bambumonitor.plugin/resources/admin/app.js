@@ -360,7 +360,6 @@
     renderRegionSelect(data.regions, config.region, signedIn);
     renderBanner(data, signedIn, expired);
     renderDevices(data, signedIn);
-    renderPreview(data.display);
     renderSnapshot(data);
     renderLoginMode();
     setBusy(state.busy);
@@ -477,11 +476,11 @@
     select.disabled = state.busy;
 
     const count = devices.length;
-    setText("device-hint", data.devicesError
+    setText("device-hint", data.monitorBlockMessage || (data.devicesError
       ? data.devicesError
       : count
         ? `共 ${count} 台设备，只监控当前选中的一台。`
-        : "设备列表暂不可用，但仍显示当前选择的打印机。");
+        : "设备列表暂不可用，但仍显示当前选择的打印机。"));
 
     const printer = data.printer || {};
     const link = printer.link || {};
@@ -495,13 +494,26 @@
     setText("last-report", printerState.lastReportAt
       ? `${formatTime(printerState.lastReportAt)}（${formatAge(printerState.lastReportAt)}）`
       : "尚未收到");
-    setText("activity", labelForActivity(printerState.activity, printerState.rawActivity));
-    setText("task-name", printerState.taskName || "—");
-    setText("progress-text", formatPercent(printerState.progressPercent));
-    setText("remaining-text", formatMinutes(printerState.remainingMinutes));
-    setText("nozzle-text", formatTemperature(printerState.nozzle));
-    setText("bed-text", formatTemperature(printerState.bed));
-    setText("error-code", printerState.errorCode || "—");
+    const freshness = printerState.freshness || {};
+    const fields = freshness.fields || {};
+    setText("activity", withFreshness(labelForActivity(printerState.activity, printerState.rawActivity), fields.activity));
+    setText("task-name", withFreshness(printerState.taskName || "—", fields.taskName));
+    setText("layer-text", `${withFreshness(Number.isFinite(printerState.layerNum) && printerState.layerNum >= 0 ? printerState.layerNum : "未知", fields.layerNum)} / ${withFreshness(Number.isFinite(printerState.totalLayerNum) && printerState.totalLayerNum >= 0 ? printerState.totalLayerNum : "未知", fields.totalLayerNum)}`);
+    setText("progress-text", withFreshness(formatPercent(printerState.progressPercent), fields.progressPercent));
+    setText("remaining-text", withFreshness(formatMinutes(printerState.remainingMinutes), fields.remainingMinutes));
+    setText("nozzle-text", formatTemperature(printerState.nozzle, fields["nozzle.current"], fields["nozzle.target"]));
+    setText("bed-text", formatTemperature(printerState.bed, fields["bed.current"], fields["bed.target"]));
+    setText("error-code", `print_error：${formatErrorChannel(printerState.printError, fields.printError)} · mc_print_error_code：${formatErrorChannel(printerState.printErrorCode, fields.printErrorCode)}`);
+    const hasReport = Number.isFinite(printerState.lastReportAt);
+    setText("report-freshness", !hasReport
+      ? "尚未收到设备状态，无法判断当前状态。"
+      : linkState !== "connected" || printerState.reportStale === true
+        ? "设备状态可能是断连前的旧数据，等待新的设备报文。"
+        : Date.now() - printerState.lastReportAt > 5 * 60 * 1000
+          ? "超过 5 分钟未收到设备报文；部分字段可能保留更早的数据。"
+          : "最近报文时间不代表所有字段的更新时间；部分字段可能保留较早的数据。");
+    renderHms(printerState.hms, fields.hms);
+    renderAms(printerState.ams, freshness.ams);
 
     const progress = $("progress-bar");
     if (progress) {
@@ -514,15 +526,83 @@
     }
   }
 
-  function renderPreview(display) {
-    const preview = $("display-preview");
-    if (!preview) return;
-    const tone = ["muted", "normal", "positive", "warning", "critical"].includes(display?.tone)
-      ? display.tone
-      : "muted";
-    preview.className = `preview tone-${tone}`;
-    setText("preview-title", display?.title || "—");
-    setText("preview-subtitle", display?.subtitle || "—");
+  function renderAms(ams, freshness) {
+    const list = $("ams-list");
+    clear(list);
+    const units = Array.isArray(ams?.units) ? ams.units : null;
+    setText("ams-empty", units === null ? (ams && Object.hasOwn(ams, "units") ? "AMS 列表未知" : "尚无 AMS 数据") : units.length ? "" : "已上报空 AMS 列表");
+    if (!list || !ams) return;
+    if (ams.rawStatus !== null && ams.rawStatus !== undefined) {
+      list.appendChild(create("li", "status-item", `AMS 状态原始值：${withFreshness(ams.rawStatus, freshness?.fields?.rawStatus)}`));
+    }
+    if (ams.rawTrayNow !== null && ams.rawTrayNow !== undefined && (!ams.current || !units)) {
+      list.appendChild(create("li", "status-item", `当前耗材原始值：${withFreshness(ams.rawTrayNow, freshness?.fields?.rawTrayNow)}`));
+    }
+    for (const unit of units || []) {
+      if (!unit || typeof unit !== "object") continue;
+      const slots = Array.isArray(unit.slots) ? unit.slots : null;
+      if (!slots) {
+        list.appendChild(create("li", "status-item", `AMS ${unit.id ?? "未知"}：暂无槽位数据，槽位信息未知`));
+        continue;
+      }
+      if (!slots.length) list.appendChild(create("li", "status-item", `AMS ${unit.id ?? "未知"}：已上报空槽位列表`));
+      for (const slot of slots) {
+        if (!slot || typeof slot !== "object") continue;
+        const item = create("li", "status-item");
+        const exists = slot.exists === true ? "存在" : slot.exists === false ? "空槽" : "未知";
+        const label = `AMS ${unit.id ?? "未知"} · 槽位 ${slot.id ?? "未知"}`;
+        const slotFreshness = freshness?.units?.[unit.id]?.slots?.[slot.id] || {};
+        // 仅凭仍然新鲜的空槽观察隐藏旧耗材；过期或未知观察不应遮住新报告的字段。
+        const observedAt = slotFreshness.exists?.at;
+        const now = Date.now();
+        const confirmedEmpty = slot.exists === false && slotFreshness.exists?.stale === false &&
+          Number.isFinite(observedAt) && observedAt <= now && now - observedAt <= 5 * 60 * 1000;
+        if (confirmedEmpty) {
+          item.appendChild(create("span", "", `${label} · 耗材：${withFreshness(exists, slotFreshness.exists)}`));
+          list.appendChild(item);
+          continue;
+        }
+        const color = typeof slot.color === "string" && /^[0-9a-f]{8}$/i.test(slot.color) ? slot.color : null;
+        if (color) {
+          const swatch = create("span", "ams-color");
+          swatch.style.backgroundColor = `#${color}`;
+          swatch.setAttribute("aria-hidden", "true");
+          item.appendChild(swatch);
+        }
+        const active = ams.current && String(ams.current.unitId) === String(unit.id) && String(ams.current.slotId) === String(slot.id);
+        const remaining = Number.isFinite(slot.remaining) && slot.remaining >= 0 && slot.remaining <= 100 ? `${slot.remaining}%` : "未知";
+        const rawState = slot.rawState === null || slot.rawState === undefined || slot.rawState === "" ? "未知" : String(slot.rawState);
+        const currentLabel = active ? `（${withFreshness("当前", freshness?.fields?.current)}）` : "";
+        item.appendChild(create("span", "", `${label}${currentLabel} · 耗材：${withFreshness(exists, slotFreshness.exists)} · 材质：${withFreshness(slot.material || "未知", slotFreshness.material)} · 颜色：${withFreshness(color ? `#${color}` : "未知", slotFreshness.color)} · 余量：${withFreshness(remaining, slotFreshness.remaining)} · 状态原始值：${withFreshness(rawState, slotFreshness.rawState)}`));
+        list.appendChild(item);
+      }
+    }
+  }
+
+  function formatErrorChannel(value, freshness) {
+    const text = value === null || value === undefined ? "未知"
+      : value === 0 ? "已清除（0）" : `原始码 ${value}`;
+    return withFreshness(text, freshness);
+  }
+
+  function renderHms(hms, freshness) {
+    const list = $("hms-list");
+    clear(list);
+    const entries = Array.isArray(hms) ? hms.filter((item) => item && typeof item === "object") : null;
+    setText("hms-empty", entries === null ? "故障信息未知" : entries.length ? "" : withFreshness("当前无已上报的 HMS 故障", freshness));
+    if (!list || !entries) return;
+    for (const entry of entries) {
+      const fields = [["代码", entry.code], ["属性", entry.attr], ["模块", entry.module]]
+        .filter(([, value]) => value !== null && value !== undefined && value !== "")
+        .map(([label, value]) => `${label}：${value}`);
+      list.appendChild(create("li", "status-item", withFreshness(fields.length ? fields.join(" · ") : "故障详情未知", freshness)));
+    }
+  }
+
+  function formatLayers(current, total) {
+    const valid = (value) => Number.isFinite(value) && value >= 0;
+    if (!valid(current) && !valid(total)) return "—";
+    return `${valid(current) ? current : "未知"} / ${valid(total) ? total : "未知"}`;
   }
 
   function renderSnapshot(data) {
@@ -916,11 +996,18 @@
     return rest === 0 ? `${hours} 小时` : `${hours} 小时 ${rest} 分`;
   }
 
-  function formatTemperature(sensor) {
-    if (!sensor) return "—";
-    const current = typeof sensor.current === "number" ? `${Math.round(sensor.current)}℃` : "—";
-    if (typeof sensor.target !== "number") return current;
-    return `${current} → ${Math.round(sensor.target)}℃`;
+  function withFreshness(value, freshness) {
+    if (!freshness || !Number.isFinite(freshness.at) || freshness.at > Date.now()) return `${value}（更新时间未知）`;
+    if (freshness.stale === true || Date.now() - freshness.at > 5 * 60 * 1000) return `${value}（旧数据）`;
+    if (freshness.stale !== false) return `${value}（更新时间未知）`;
+    return String(value);
+  }
+
+  function formatTemperature(sensor, currentFreshness, targetFreshness) {
+    const current = typeof sensor?.current === "number" && Number.isFinite(sensor.current) ? `${Math.round(sensor.current)}℃` : "—";
+    const formatted = withFreshness(current, currentFreshness);
+    if (typeof sensor?.target !== "number" || !Number.isFinite(sensor.target)) return formatted;
+    return `${formatted} → ${withFreshness(`${Math.round(sensor.target)}℃`, targetFreshness)}`;
   }
 
   function labelForActivity(activity, rawActivity) {
@@ -933,8 +1020,8 @@
       failed: "打印异常",
       unknown: "未知",
     };
-    if (activity && labels[activity]) return labels[activity];
-    return rawActivity ? `未知（原始值 ${rawActivity}）` : "未知";
+    if (activity && activity !== "unknown" && Object.hasOwn(labels, activity)) return labels[activity];
+    return rawActivity ? `未知（原始值 ${rawActivity}）` : activity && activity !== "unknown" ? `未知（原始值 ${activity}）` : "未知";
   }
 
   function labelForLink(linkState, link) {

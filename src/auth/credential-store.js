@@ -58,62 +58,61 @@ function run(command, args, { input, timeoutMs = 5000 } = {}) {
         stderr: Buffer.concat(err).toString("utf8"),
       });
     });
+    child.stdin.on("error", () => {}); // 子进程提前退出时不暴露写入内容。
     if (input !== undefined) child.stdin.end(input);
     else child.stdin.end();
   });
 }
 
-/** macOS 钥匙串后端。令牌通过 stdin 之外的参数传递，这里尽量缩短其生命周期。 */
+/** macOS 钥匙串：写入数据仅经子进程标准输入传递。 */
 function createKeychainBackend({ service = SERVICE_NAME, account = ACCOUNT_NAME, runner = run } = {}) {
+  // security 的交互命令按空格解析，标识符必须是受控的单个参数。
+  if (![service, account].every((value) => typeof value === "string" && /^[A-Za-z0-9._-]+$/.test(value))) {
+    throw new TypeError("钥匙串标识无效");
+  }
+  const prefix = "bambu-base64-v1:";
   return {
     kind: "keychain",
+    cleanupWhenUnavailable: true,
     async probe() {
-      if (process.platform !== "darwin") return { available: false, reason: "当前平台不支持钥匙串" };
-      // `security` 在无交互会话（例如沙箱、SSH）里会返回 Operation not permitted，
-      // 用一次读取探测即可，不要用写入探测，避免污染钥匙串。
-      const result = await runner("security", ["find-generic-password", "-s", service, "-a", account, "-w"]);
-      if (result.code === 44) return { available: true, reason: "" }; // item not found，但工具可用
-      if (result.code === 0) return { available: true, reason: "" };
-      if (/Operation not permitted|not allowed/i.test(result.stderr)) {
-        return { available: false, reason: "系统钥匙串拒绝了当前进程的访问" };
-      }
-      if (result.code === -1) return { available: false, reason: "找不到 security 命令" };
-      return { available: false, reason: result.stderr.trim() || "钥匙串不可用" };
+      const result = await runner("/usr/bin/security", ["default-keychain"]);
+      return result.code === 0
+        ? { available: true, reason: "" }
+        : { available: false, reason: "无法访问系统钥匙串，令牌仅保留在内存中，重启后需重新登录" };
     },
     async read() {
-      const result = await runner("security", ["find-generic-password", "-s", service, "-a", account, "-w"]);
+      const result = await runner("/usr/bin/security", ["find-generic-password", "-s", service, "-a", account, "-w"]);
       if (result.code === 44) return null;
-      if (result.code !== 0) throw new Error(result.stderr.trim() || "读取钥匙串失败");
-      return result.stdout.trim() || null;
+      if (result.code !== 0) throw new Error("读取系统钥匙串失败");
+      const value = result.stdout.trim();
+      if (!value.startsWith(prefix)) return value || null; // 兼容旧版本存储的记录。
+      const encoded = value.slice(prefix.length);
+      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error("钥匙串记录格式无效");
+      return Buffer.from(encoded, "base64").toString("utf8") || null;
     },
     async write(secret) {
-      // 先删除旧条目再写入，避免 -U 在部分系统版本上残留旧属性。
-      await runner("security", ["delete-generic-password", "-s", service, "-a", account]);
-      const result = await runner("security", ["add-generic-password", "-a", account, "-s", service, "-w", secret]);
-      if (result.code !== 0) throw new Error(result.stderr.trim() || "写入钥匙串失败");
+      if (typeof secret !== "string" || !secret) throw new TypeError("凭据无效");
+      const value = prefix + Buffer.from(secret, "utf8").toString("base64");
+      // security -i 的命令通过 stdin 输入；交互模式不可靠地返回子命令退出码，
+      // 因此必须再次读取并比较，才视为持久化成功。
+      const result = await runner("/usr/bin/security", ["-i"], {
+        input: `add-generic-password -U -s ${service} -a ${account} -w ${value}\n`,
+      });
+      if (result.code !== 0 || await this.read() !== secret) throw new Error("写入系统钥匙串失败");
     },
     async clear() {
-      const result = await runner("security", ["delete-generic-password", "-s", service, "-a", account]);
-      if (result.code !== 0 && result.code !== 44) throw new Error(result.stderr.trim() || "删除钥匙串条目失败");
+      const result = await runner("/usr/bin/security", ["delete-generic-password", "-s", service, "-a", account]);
+      if (result.code !== 0 && result.code !== 44) throw new Error("删除系统钥匙串中的旧凭据失败，请在钥匙串访问中手动删除");
     },
   };
 }
 
-/**
- * Windows 凭据管理器后端（cmdkey）。
- *
- * cmdkey 只能保存"目标/用户名"，不能读回密码，因此这里使用 PowerShell 的 DPAPI 加密文件方案：
- * 用当前用户作用域加密后写入插件目录，仅当前 Windows 用户可解密。
- * 该路径尚未在真实 Windows 环境验证，`probe()` 会返回 `verified: false`。
- */
-function createWindowsBackend({ runner = run } = {}) {
+/** Windows 安全持久化尚未实现，使用内存回退。 */
+function createWindowsBackend() {
   return {
     kind: "dpapi",
     async probe() {
-      if (process.platform !== "win32") return { available: false, reason: "当前平台不支持 Windows 凭据存储" };
-      const result = await runner("powershell", ["-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
-      if (result.code !== 0) return { available: false, reason: "无法调用 PowerShell" };
-      return { available: true, verified: false, reason: "DPAPI 方案尚未在真实 Windows 环境验证" };
+      return { available: false, reason: "Windows 安全存储尚未实现，令牌仅保留在内存中，重启后需重新登录" };
     },
     async read() {
       throw new Error("Windows 凭据存储尚未实现");
@@ -194,18 +193,22 @@ function createCredentialStore({ platform = process.platform, backend } = {}) {
         await fallback.write(secret);
         return { persisted: false, reason: info.reason || "安全存储不可用" };
       }
-      await selected.write(secret);
-      return { persisted: true, reason: "" };
+      try {
+        await selected.write(secret);
+        return { persisted: true, reason: "" };
+      } catch {
+        // 避免重启时恢复上一次账号；无法确认旧记录已删除则拒绝降级。
+        await selected.clear();
+        await fallback.write(secret);
+        probeResult = { backend: selected.kind, available: false, reason: "无法写入系统安全存储，令牌仅保留在内存中，重启后需重新登录" };
+        return { persisted: false, reason: probeResult.reason };
+      }
     },
     async clear() {
       await fallback.clear();
       const info = await status();
-      if (!info.available) return;
-      try {
-        await selected.clear();
-      } catch {
-        // 删除失败不应阻断退出登录流程，本地缓存仍会被清空。
-      }
+      if (!info.available && !selected.cleanupWhenUnavailable) return;
+      await selected.clear();
     },
   };
 }

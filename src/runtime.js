@@ -11,6 +11,7 @@ const {
   buildViewDetails,
   createDrawThrottle,
   fingerprintDisplay,
+  fieldIsFresh,
   nextView,
   VIEWS,
 } = require("./display/presenter");
@@ -71,7 +72,12 @@ function createPluginRuntime({
   let activeMonitor = null;
   let devices = [];
   let devicesError = null;
+  // 只有当前会话成功读取的设备列表才能授权监控。
+  let verifiedToken = null;
   let started = false;
+  let shuttingDown = false;
+  let sessionGeneration = 0;
+  let deviceRequestGeneration = 0;
   /** 浏览器后台控制器由入口在创建后注入，runtime 不依赖 HTTP 细节。 */
   let adminController = null;
   // 串行化配置读取和写入，避免并发请求互相覆盖。
@@ -86,13 +92,9 @@ function createPluginRuntime({
   /** 每个按键的视图，按键点击时轮换。 */
   const views = new Map();
 
-  function redactSecrets() {
-    const token = auth.getAccessToken();
-    return token ? [token] : [];
-  }
-
-  function logError(message, error) {
-    safeLogger.error(`${message}：${error?.message || error}`, redactSecrets());
+  function logError(message) {
+    // 异常可能包含设备文本、云响应或凭据，日志只记录固定上下文。
+    safeLogger.error(message);
   }
 
   /** 由入口注入浏览器后台控制器；runtime 本身不感知 HTTP。 */
@@ -104,8 +106,25 @@ function createPluginRuntime({
   // 展示与绘制
   // ---------------------------------------------------------------------
 
+  function clearDeviceVerification() {
+    verifiedToken = null;
+    devices = [];
+    devicesError = null;
+  }
+
+  function monitorBlockMessage() {
+    if (auth.state !== STATES.signedIn || !config.printerId) return "";
+    if (!verifiedToken || verifiedToken !== auth.getAccessToken()) {
+      return devicesError ? "设备列表读取失败，无法确认设备归属" : "等待验证当前账号的设备列表";
+    }
+    if (!devices.some((device) => device.id === config.printerId)) return "所选设备不在当前账号的设备列表中";
+    return "";
+  }
+
   function buildDisplayFor(view) {
     const printerId = config.printerId;
+    const blocked = monitorBlockMessage();
+    if (blocked) return { tone: "warning", title: "无法连接设备", subtitle: blocked, icon: "cloud-off", stale: true };
     const base = buildDisplay({
       signedIn: auth.state === STATES.signedIn,
       authExpired: auth.state === STATES.expired,
@@ -117,8 +136,16 @@ function createPluginRuntime({
     // 只有确实收到过设备报文时，温度 / 任务视图才有意义；
     // 登录提示等前置状态仍然显示原因，而不是一片 "无数据"。
     const hasReport = printer.state?.lastReportAt !== null && printer.state?.lastReportAt !== undefined;
-    if (view && view !== "progress" && hasReport && printer.status?.state === "connected") {
-      const details = buildViewDetails(printer.state, view);
+    if (view && view !== "progress" && hasReport && printer.status?.state === "connected" && !base.stale && base.tone !== "critical") {
+      const source = printer.state;
+      const at = now();
+      const fields = view === "temperature"
+        ? [["nozzle.current", source.nozzle?.current], ["nozzle.target", source.nozzle?.target], ["bed.current", source.bed?.current], ["bed.target", source.bed?.target]]
+        : [["taskName", source.taskName], ["layerNum", source.layerNum], ["totalLayerNum", source.totalLayerNum]];
+      if (fields.some(([field, value]) => value != null && !fieldIsFresh(source, field, at))) {
+        return { ...base, tone: "warning", title: "数据已过期", subtitle: "部分字段等待更新", stale: true };
+      }
+      const details = buildViewDetails(source, view);
       return { ...base, title: details.title, subtitle: details.subtitle };
     }
     return base;
@@ -161,7 +188,11 @@ function createPluginRuntime({
     const previous = config;
     config = normalizeConfig(next);
     const printerChanged = config.printerId !== previous.printerId;
-    if (config.region !== previous.region) auth.cancelPendingLogin();
+    if (config.region !== previous.region) {
+      sessionGeneration += 1;
+      clearDeviceVerification();
+      auth.cancelPendingLogin();
+    }
     if (config.region !== previous.region && auth.state === STATES.signedIn) {
       // 区域变更后旧令牌属于另一个服务端，必须停止监控并要求重新登录。
       activeMonitor = null;
@@ -187,6 +218,7 @@ function createPluginRuntime({
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
         const stored = await plugin.getConfig?.();
+        if (shuttingDown) return false;
         applyConfig(stored);
         return true;
       } catch (error) {
@@ -204,22 +236,41 @@ function createPluginRuntime({
   async function refreshDevices() {
     if (auth.state !== STATES.signedIn) return { status: "error", message: "请先登录" };
     const token = auth.getAccessToken();
+    const epoch = sessionGeneration;
+    const requestGeneration = ++deviceRequestGeneration;
+    clearDeviceVerification();
+    if (activeMonitor) {
+      activeMonitor = null;
+      Promise.resolve(printer.disconnect()).catch(() => logError("断开云端连接失败"));
+    }
+    renderAll({ urgent: true }).catch(() => {});
+    const current = () => !shuttingDown && epoch === sessionGeneration && requestGeneration === deviceRequestGeneration && auth.state === STATES.signedIn && auth.getAccessToken() === token;
     if (!token) {
       await auth.invalidate();
       return { status: "error", message: "登录已失效，请重新登录" };
     }
     try {
       const api = createApiFn(resolveRegion(auth.getRegion() || config.region).id);
-      devices = await api.fetchDevices(token);
+      const list = await api.fetchDevices(token);
+      if (!current()) return { status: "cancelled" };
+      devices = list;
+      verifiedToken = token;
       devicesError = null;
+      startMonitoring();
+      renderAll({ urgent: true }).catch(() => {});
       return { status: "success", devices };
     } catch (error) {
-      devicesError = error?.message || "无法读取设备列表";
-      logError("读取设备列表失败", error);
+      if (!current()) return { status: "cancelled" };
+      devicesError = "无法读取设备列表，请检查登录状态和网络";
+      renderAll({ urgent: true }).catch(() => {});
+      safeLogger.error("读取设备列表失败");
       // 令牌失效必须转移到"需要重新登录"，否则界面会一直停留在登录态。
       if (error?.kind === ERROR_KINDS.unauthorized) {
+        sessionGeneration += 1;
         activeMonitor = null;
-        printer.disconnect();
+        clearDeviceVerification();
+        devicesError = "登录已失效，请重新登录";
+        Promise.resolve(printer.disconnect()).catch(() => logError("断开云端连接失败"));
         await auth.invalidate("登录已失效，请重新登录");
         renderAll({ urgent: true }).catch(() => {});
       }
@@ -228,21 +279,31 @@ function createPluginRuntime({
   }
 
   /** 登录成功后的统一收尾：刷设备、单设备自动选中、启动监控。 */
-  async function finishSignIn() {
+  async function finishSignIn(epoch) {
+    const token = auth.getAccessToken();
+    const current = () => !shuttingDown && epoch === sessionGeneration && auth.state === STATES.signedIn && auth.getAccessToken() === token;
+    if (!token || !current()) return;
     await refreshDevices();
+    if (!current()) return;
     await queueConfig(async () => {
+      if (!current()) return;
       if (!config.printerId && devices.length === 1) {
         const only = devices[0];
         const next = { ...config, printerId: only.id, printerName: only.name };
         try {
           await plugin.setConfig?.(next);
+          if (!current()) {
+            // 写入在退出前已开始；恢复排队时的现有配置，避免保存旧账号设备。
+            await plugin.setConfig?.(config);
+            return;
+          }
           applyConfig(next);
         } catch (error) {
           logError("保存插件配置失败", error);
         }
       }
     });
-    startMonitoring();
+    if (current()) startMonitoring();
   }
 
   // ---------------------------------------------------------------------
@@ -258,6 +319,9 @@ function createPluginRuntime({
     if (!token) return { started: false, reason: "no-token" };
     if (!userId) return { started: false, reason: "no-user-id" };
     if (!config.printerId) return { started: false, reason: "no-printer" };
+    if (verifiedToken !== token || !devices.some((device) => device.id === config.printerId)) {
+      return { started: false, reason: "device-unverified" };
+    }
     if (activeMonitor && activeMonitor.printerId === config.printerId && activeMonitor.token === token) {
       return { started: false, reason: "already-running" };
     }
@@ -276,6 +340,17 @@ function createPluginRuntime({
   let lastActivity = null;
 
   printer.subscribe((change) => {
+    if (change.type === "connection" && change.status?.state === "failed" &&
+        change.status?.lastError?.kind === "unauthorized" && activeMonitor &&
+        activeMonitor.printerId === config.printerId && activeMonitor.token === auth.getAccessToken()) {
+      sessionGeneration += 1;
+      activeMonitor = null;
+      clearDeviceVerification();
+      Promise.resolve(printer.disconnect()).catch(() => logError("断开云端连接失败"));
+      auth.invalidate("登录已失效，请重新登录")
+        .catch(() => logError("清理本地凭据失败"))
+        .finally(() => renderAll({ urgent: true }).catch(() => {}));
+    }
     if (change.type === "state" || change.type === "connection") {
       const urgent = change.type === "connection" || change.state?.activity !== lastActivity;
       lastActivity = change.state?.activity ?? lastActivity;
@@ -344,6 +419,21 @@ function createPluginRuntime({
   // UI 消息
   // ---------------------------------------------------------------------
 
+  /** 认证方法在首次 await 前同步进入 signingIn；busy 或校验失败不会启动新代次。 */
+  function beginAuthentication(start) {
+    const previousState = auth.state;
+    const result = start();
+    if (previousState !== STATES.signingIn && auth.state === STATES.signingIn) {
+      sessionGeneration += 1;
+      clearDeviceVerification();
+      if (activeMonitor) {
+        activeMonitor = null;
+        Promise.resolve(printer.disconnect()).catch(() => logError("断开云端连接失败"));
+      }
+    }
+    return { result, epoch: sessionGeneration };
+  }
+
   const actions = {
     async status() {
       return {
@@ -353,6 +443,7 @@ function createPluginRuntime({
         credentialStore: await credentialStore.status(),
         devices,
         devicesError,
+        monitorBlockMessage: monitorBlockMessage(),
         printer: { id: config.printerId, name: printer.printerName, state: printer.state, link: printer.status },
         display: buildDisplayFor("progress"),
         views: Array.from(views.entries()).map(([uid, view]) => ({ uid, view })),
@@ -364,33 +455,55 @@ function createPluginRuntime({
       return adminController.open();
     },
     async requestCode(payload) {
-      const result = await auth.requestEmailCode({ region: config.region, account: payload?.account });
+      const { result: pending, epoch } = beginAuthentication(() =>
+        auth.requestEmailCode({ region: config.region, account: payload?.account }));
+      const result = await pending;
       // 少数账号不需要验证码，服务端会直接返回令牌；此时与密码登录走同样的收尾。
-      if (result.status === "success") await finishSignIn();
+      if (result.status === "success") await finishSignIn(epoch);
       renderAll({ urgent: true }).catch(() => {});
       return { status: result.status, message: result.message || result.error?.message || "", auth: result, devices, config };
     },
     async login(payload) {
-      const result = payload?.code
-        ? await auth.submitCode({ code: payload.code })
-        : await auth.loginWithPassword({
+      const { result: pending, epoch } = beginAuthentication(() => payload?.code
+        ? auth.submitCode({ code: payload.code })
+        : auth.loginWithPassword({
           region: config.region,
           account: payload?.account,
           password: payload?.password,
-        });
-      if (result.status === "success") await finishSignIn();
+        }));
+      const result = await pending;
+      if (result.status === "success") await finishSignIn(epoch);
       renderAll({ urgent: true }).catch(() => {});
       return { status: result.status, message: result.error?.message || "", auth: result, devices, config };
     },
     async cancelCode() {
+      if ([STATES.signingIn, STATES.awaitingCode, STATES.awaitingTwoFactor].includes(auth.state)) sessionGeneration += 1;
       return { status: "success", auth: auth.cancelPendingLogin() };
     },
     async logout() {
+      const epoch = ++sessionGeneration;
       activeMonitor = null;
-      printer.disconnect();
-      await auth.logout({ revokeRemote: true });
-      devices = [];
-      devicesError = null;
+      let disconnecting;
+      try {
+        disconnecting = Promise.resolve(printer.disconnect());
+      } catch {
+        disconnecting = Promise.reject(new Error("无法确认云端连接已关闭"));
+      }
+      // 退出立即清除旧界面数据，异步撤销完成后不得覆盖新会话。
+      clearDeviceVerification();
+      const [cleanup, disconnected] = await Promise.allSettled([
+        auth.logout({ revokeRemote: true }),
+        disconnecting,
+      ]);
+      if (disconnected.status === "rejected") logError("断开云端连接失败");
+      if (cleanup.status === "rejected" || disconnected.status === "rejected") {
+        const message = cleanup.status === "rejected"
+          ? "已退出登录，但旧凭据可能仍在系统钥匙串中，请手动删除"
+          : "已退出登录，但无法确认云端连接已关闭";
+        if (epoch === sessionGeneration) renderAll({ urgent: true }).catch(() => {});
+        return { status: "error", message };
+      }
+      if (epoch !== sessionGeneration || shuttingDown) return { status: "cancelled" };
       renderAll({ urgent: true }).catch(() => {});
       return { status: "success", auth: auth.snapshot() };
     },
@@ -398,12 +511,23 @@ function createPluginRuntime({
       return refreshDevices();
     },
     async setPrinter(payload) {
+      const epoch = sessionGeneration;
+      const token = auth.getAccessToken();
+      const current = () => !shuttingDown && epoch === sessionGeneration && auth.getAccessToken() === token;
       return queueConfig(async () => {
+        if (!current()) return { status: "cancelled" };
         const printerId = typeof payload?.printerId === "string" ? payload.printerId : "";
         const device = devices.find((item) => item.id === printerId);
+        if (printerId && auth.state === STATES.signedIn && (verifiedToken !== token || !device)) {
+          return { status: "error", message: "所选设备不在当前账号的设备列表中" };
+        }
         const next = { ...config, printerId, printerName: device?.name || payload?.printerName || "" };
         try {
           await plugin.setConfig(next);
+          if (!current()) {
+            await plugin.setConfig(config);
+            return { status: "cancelled" };
+          }
         } catch (error) {
           logError("保存插件配置失败", error);
           return { status: "error", message: "保存插件配置失败" };
@@ -414,12 +538,18 @@ function createPluginRuntime({
       });
     },
     async setRegion(payload) {
+      const epoch = sessionGeneration;
       return queueConfig(async () => {
+        if (shuttingDown || epoch !== sessionGeneration) return { status: "cancelled" };
         const region = resolveRegion(payload?.region).id;
         if (region === config.region) return { status: "success", config };
         const next = { ...config, region };
         try {
           await plugin.setConfig(next);
+          if (shuttingDown || epoch !== sessionGeneration) {
+            await plugin.setConfig(config);
+            return { status: "cancelled" };
+          }
         } catch (error) {
           logError("保存插件配置失败", error);
           return { status: "error", message: "保存插件配置失败" };
@@ -433,16 +563,20 @@ function createPluginRuntime({
     },
     async testConnection(payload) {
       const region = resolveRegion(payload?.region || config.region).id;
+      const epoch = sessionGeneration;
+      const token = auth.getAccessToken();
+      const current = () => !shuttingDown && epoch === sessionGeneration && token === auth.getAccessToken() && auth.state === STATES.signedIn;
       try {
         const api = createApiFn(region);
-        const token = auth.getAccessToken();
         if (!token) return { status: "error", message: "请先登录" };
         const list = await api.fetchDevices(token);
+        if (!current()) return { status: "cancelled" };
         return { status: "success", message: `已读取 ${list.length} 台绑定设备`, devices: list };
       } catch (error) {
+        if (!current()) return { status: "cancelled" };
         return {
           status: "error",
-          message: error?.message || "连接测试失败",
+          message: "连接测试失败，请检查登录状态和网络",
           kind: error?.kind,
         };
       }
@@ -458,7 +592,7 @@ function createPluginRuntime({
       return await actions[action](payload);
     } catch (error) {
       logError(`处理界面消息 ${action} 失败`, error);
-      return { status: "error", message: error?.message || "操作失败" };
+      return { status: "error", message: "操作失败" };
     }
   });
 
@@ -471,10 +605,12 @@ function createPluginRuntime({
     started = true;
     ensureDrawTimer();
     await loadConfig();
+    if (shuttingDown) return;
+    const epoch = sessionGeneration;
     const hydrated = await auth.hydrate();
+    if (shuttingDown || epoch !== sessionGeneration) return;
     if (hydrated.state === STATES.signedIn) {
-      startMonitoring();
-      // 设备列表在后台补拉，不阻塞按键首帧。
+      // 不能在确认当前账号设备列表前使用恢复的设备选择。
       refreshDevices().catch((error) => logError("读取设备列表失败", error));
     }
     await renderAll({ urgent: true });
@@ -482,13 +618,17 @@ function createPluginRuntime({
 
   /** 退出时先关闭浏览器后台，再断开云连接，避免留下监听端口。 */
   async function shutdown() {
+    shuttingDown = true;
+    sessionGeneration += 1;
+    activeMonitor = null;
+    const disconnecting = printer.disconnect();
     try {
       await adminController?.stop?.();
     } catch (error) {
       logError("关闭浏览器后台失败", error);
     }
     try {
-      printer.disconnect();
+      await disconnecting;
     } catch (error) {
       logError("断开云端连接失败", error);
     }
