@@ -1,0 +1,325 @@
+/**
+ * 云 MQTT 连接（见 docs/云端监控设计方案.md §6.2）。
+ *
+ * 社区资料描述的方案：用云账号令牌连接 MQTT，订阅 `device/{DEVICE_ID}/report`。
+ * 需要在该区域的服务地址、用户标识、令牌权限、TLS 证书都验证过之后才真正可用。
+ *
+ * 这里刻意把网络层封装成可注入的 `createClient`，这样：
+ * - 单元测试可以用假客户端验证订阅、重连、退避和令牌失效；
+ * - 换成别的 MQTT 库或改用 WebSocket 不需要改上层逻辑。
+ */
+
+const TOPIC_PREFIX = "device";
+
+/** 与 mqtt 库的错误码对齐，但只依赖数字常量，避免测试引入真实依赖。 */
+const MQTT_ERRORS = {
+  connectionRefused: 1,
+  unauthorized: 4,
+  notAuthorized: 5,
+};
+
+/** 认知中的云端状态主题。 */
+function reportTopic(deviceId) {
+  return `${TOPIC_PREFIX}/${deviceId}/report`;
+}
+
+function requestTopic(deviceId) {
+  return `${TOPIC_PREFIX}/${deviceId}/request`;
+}
+
+function defaultCreateClient(url, options) {
+  // 延迟加载：只有真正要连云端时才引入 mqtt，避免影响插件启动时间。
+  const mqtt = require("mqtt");
+  return mqtt.connect(url, options);
+}
+
+function randomClientId(random = Math.random) {
+  const suffix = Math.floor(random() * 1e9).toString(36);
+  return `flexbar-bambu-monitor-${suffix}`;
+}
+
+/** 指数退避 + 抖动：第 n 次失败后退避 base * 2^(n-1)，并随机抖动 0–40%。 */
+function backoffDelay(attempt, { baseMs = 2_000, maxMs = 60_000, random = Math.random } = {}) {
+  const safeAttempt = Math.max(1, Math.min(attempt, 12));
+  const raw = Math.min(maxMs, baseMs * 2 ** (safeAttempt - 1));
+  const jitter = raw * 0.4 * random();
+  return Math.round(raw + jitter);
+}
+
+const CONNECTION_STATES = {
+  idle: "idle",
+  connecting: "connecting",
+  connected: "connected",
+  reconnecting: "reconnecting",
+  failed: "failed",
+};
+
+/**
+ * @param {object} options
+ * @param {string} options.host
+ * @param {number} options.port
+ * @param {string} options.username 形如 `u_{uid}`
+ * @param {string} options.password 访问令牌
+ * @param {string} options.deviceId
+ * @param {object} options.logger
+ * @param {(url: string, options: object) => object} [options.createClient]
+ * @param {() => number} [options.now]
+ * @param {() => number} [options.random]
+ */
+function createCloudMqttClient({
+  host,
+  port = 8883,
+  username,
+  password,
+  deviceId,
+  logger,
+  createClient = defaultCreateClient,
+  now = () => Date.now(),
+  random = Math.random,
+  baseBackoffMs = 2_000,
+  maxBackoffMs = 60_000,
+  keepaliveSeconds = 60,
+  pushallCooldownMs = 5 * 60_000,
+}) {
+  let client = null;
+  let state = CONNECTION_STATES.idle;
+  let attempt = 0;
+  let stopped = true;
+  let reconnectTimer = null;
+  // null 表示从未请求过：用 0 会在时钟从 0 开始的测试里被误判成"冷却中"。
+  let lastPushallAt = null;
+  let lastError = null;
+  let reportHandler = null;
+  let statusHandler = null;
+  let subscribed = false;
+
+  function emitStatus(patch = {}) {
+    const payload = { state, attempt, lastError, subscribed, ...patch };
+    if (statusHandler) {
+      try {
+        statusHandler(payload);
+      } catch (error) {
+        logger?.warn?.(`MQTT 状态回调失败：${error?.message || error}`);
+      }
+    }
+  }
+
+  function setState(next, patch) {
+    if (state === next && !patch) return;
+    state = next;
+    emitStatus(patch);
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect(reason) {
+    if (stopped) return;
+    clearReconnectTimer();
+    attempt += 1;
+    const delay = backoffDelay(attempt, { baseMs: baseBackoffMs, maxMs: maxBackoffMs, random });
+    setState(CONNECTION_STATES.reconnecting, { nextRetryInMs: delay, reason });
+    logger?.warn?.(`云连接中断（${reason}），${Math.round(delay / 1000)} 秒后重试（第 ${attempt} 次）`);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+    if (typeof reconnectTimer.unref === "function") reconnectTimer.unref();
+  }
+
+  /** 令牌失效时停止持续重试，交给上层提示重新登录。 */
+  function failAuth(reason) {
+    stopped = true;
+    clearReconnectTimer();
+    teardownClient();
+    lastError = { kind: "unauthorized", message: reason };
+    setState(CONNECTION_STATES.failed, { reason });
+    logger?.error?.(`云连接认证失败：${reason}`);
+  }
+
+  function teardownClient() {
+    const current = client;
+    client = null;
+    subscribed = false;
+    if (!current) return;
+    try {
+      current.removeAllListeners?.();
+      current.end?.(true);
+    } catch {
+      // 连接已经坏了，忽略清理错误。
+    }
+  }
+
+  function handleMessage(topic, payload) {
+    if (topic !== reportTopic(deviceId)) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload.toString());
+    } catch {
+      logger?.warn?.("收到无法解析的云端报文，已忽略");
+      return;
+    }
+    const raw = parsed?.print;
+    if (!raw || typeof raw !== "object") {
+      return;
+    }
+    if (raw.command && raw.command !== "push_status" && raw.command !== "pushall") return;
+    if (!reportHandler) return;
+    try {
+      reportHandler({ raw, receivedAt: now() });
+    } catch (error) {
+      logger?.error?.(`处理云端报文失败：${error?.message || error}`);
+    }
+  }
+
+  function connect() {
+    if (stopped) return;
+    // 已经有一个连接时不重复建立。
+    if (client) return;
+    attempt = attempt === 0 ? 1 : attempt;
+    setState(attempt > 1 ? CONNECTION_STATES.reconnecting : CONNECTION_STATES.connecting);
+
+    const url = `mqtts://${host}:${port}`;
+    const options = {
+      username,
+      password,
+      clientId: randomClientId(random),
+      clean: true,
+      keepalive: keepaliveSeconds,
+      reconnectPeriod: 0, // 重连由本模块控制，才能做真正的抖动退避。
+      connectTimeout: 15_000,
+      rejectUnauthorized: true, // 设计文档要求使用 TLS 并验证证书，不全局关闭校验。
+    };
+
+    let next;
+    try {
+      next = createClient(url, options);
+    } catch (error) {
+      lastError = { kind: "network", message: error?.message || "无法创建云连接" };
+      scheduleReconnect("create-failed");
+      return;
+    }
+    client = next;
+
+    next.on("connect", () => {
+      attempt = 0;
+      lastError = null;
+      setState(CONNECTION_STATES.connected);
+      const topic = reportTopic(deviceId);
+      try {
+        next.subscribe(topic, { qos: 0 }, (error) => {
+          if (error) {
+            lastError = { kind: "network", message: error?.message || "订阅失败" };
+            logger?.warn?.(`订阅云端状态失败：${error?.message || error}`);
+            return;
+          }
+          subscribed = true;
+          emitStatus();
+          logger?.info?.(`已连接云端并订阅 ${topic}`);
+        });
+      } catch (error) {
+        logger?.warn?.(`订阅云端状态失败：${error?.message || error}`);
+      }
+    });
+
+    next.on("message", handleMessage);
+
+    next.on("error", (error) => {
+      const code = error?.code;
+      lastError = { kind: code === MQTT_ERRORS.notAuthorized ? "unauthorized" : "network", message: error?.message || "云连接错误" };
+      if (code === MQTT_ERRORS.notAuthorized || code === MQTT_ERRORS.unauthorized) {
+        failAuth("云端拒绝了凭据，登录可能已失效");
+      }
+      // 其它错误由 'close' 统一触发重连，避免两处各排一个定时器。
+    });
+
+    next.on("close", () => {
+      client = null;
+      subscribed = false;
+      if (stopped) return;
+      if (state === CONNECTION_STATES.failed) return;
+      scheduleReconnect("connection-closed");
+    });
+  }
+
+  return {
+    get state() {
+      return state;
+    },
+    get subscribed() {
+      return subscribed;
+    },
+    get attempt() {
+      return attempt;
+    },
+    onReport(handler) {
+      reportHandler = handler;
+    },
+    onStatus(handler) {
+      statusHandler = handler;
+    },
+    start() {
+      if (!host || !username || !password || !deviceId) {
+        lastError = { kind: "config", message: "缺少云连接所需的地址、用户标识或令牌" };
+        setState(CONNECTION_STATES.failed, { reason: "missing-config" });
+        return false;
+      }
+      if (!stopped) return true;
+      stopped = false;
+      attempt = 0;
+      emitStatus();
+      connect();
+      return true;
+    },
+    stop() {
+      stopped = true;
+      clearReconnectTimer();
+      teardownClient();
+      state = CONNECTION_STATES.idle;
+      attempt = 0;
+      emitStatus();
+    },
+    /**
+     * 主动请求完整状态。
+     *
+     * 这是状态查询而不是打印控制；P1P 上每 5 分钟一次都可能造成卡顿，
+     * 因此这里强制冷却，和重连、手动刷新共享限制。
+     */
+    requestFullState({ force = false } = {}) {
+      if (!client || state !== CONNECTION_STATES.connected) return { sent: false, reason: "not-connected" };
+      const stamp = now();
+      if (!force && lastPushallAt !== null && stamp - lastPushallAt < pushallCooldownMs) {
+        return { sent: false, reason: "cooldown", retryInMs: pushallCooldownMs - (stamp - lastPushallAt) };
+      }
+      lastPushallAt = stamp;
+      try {
+        client.publish(
+          requestTopic(deviceId),
+          JSON.stringify({ pushing: { sequence_id: "0", command: "pushall", version: 1, push_target: 1 } }),
+          { qos: 1 },
+        );
+        return { sent: true, reason: null };
+      } catch (error) {
+        return { sent: false, reason: error?.message || "发送失败" };
+      }
+    },
+    status() {
+      return { state, attempt, lastError, subscribed };
+    },
+  };
+}
+
+module.exports = {
+  TOPIC_PREFIX,
+  MQTT_ERRORS,
+  CONNECTION_STATES,
+  reportTopic,
+  requestTopic,
+  backoffDelay,
+  randomClientId,
+  createCloudMqttClient,
+};

@@ -1,10 +1,10 @@
 {
     "name": "Bambu Monitor",
     "uuid": "com.upkiry.bambumonitor",
-    "version": "0.1.0",
+    "version": "0.3.1",
     "author": "upkiry",
     "entry": "backend/plugin.cjs",
-    "description": "Bambu printer monitor for Flexbar",
+    "description": "在 Flexbar 上监控 Bambu Lab 打印机的云端状态与打印进度",
     "repo": "",
     "sdk": {
         "version": "1.0.7"
@@ -28,47 +28,41 @@
             "version": "1.0.0"
         }
     ],
-    "configPage": "",
+    "configPage": "configPage",
     "keyLibrary": {
         "title": "$PluginName",
         "style": {
-            "icon": "mdi mdi-puzzle"
+            "icon": "mdi mdi-printer-3d"
         },
         "children": [
-          {
-              "title": "$Counter.Title",
-              "tip": "$Counter.Tip",
-              "cid": "com.upkiry.bambumonitor.counter",
-              "config": {
-                  "keyType": "default",
-                  "clickable": true,
-                  "platform": [
-                      "windows",
-                      "mac"
-                  ]
-              },
-              "style": {
-                  "icon": "mdi mdi-gesture-tap-button",
-                  "width": 240
-              },
-              "data": {
-                  "rangeMin": "0",
-                  "rangeMax": "100"
-              }
-          }
+            {
+                "title": "打印机状态",
+                "tip": "查看所选 Bambu 打印机的云端状态、打印进度与温度",
+                "cid": "com.upkiry.bambumonitor.monitor",
+                "config": {
+                    "keyType": "default",
+                    "clickable": true,
+                    "platform": [
+                        "windows",
+                        "mac"
+                    ]
+                },
+                "style": {
+                    "icon": "mdi mdi-printer-3d",
+                    "width": 240
+                },
+                "data": {
+                    "view": "progress"
+                }
+            }
         ]
     },
     "local": {
+        "zh-CN": {
+            "PluginName": "Bambu 监控"
+        },
         "en": {
-            "PluginName": "Bambu Monitor",
-            "Counter": {
-                "Title": "Tap Counter",
-                "Tip": "Default keys with customizable drawable content",
-                "UI": {
-                    "RangeMin": "Minimum Value",
-                    "RangeMax": "Maximum Value"
-                }
-            }
+            "PluginName": "Bambu Monitor"
         }
     }
 }

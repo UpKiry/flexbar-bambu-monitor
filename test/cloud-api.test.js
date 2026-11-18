@@ -1,0 +1,202 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { CloudApi, CloudApiError, ERROR_KINDS, classifyServiceError } = require("../src/cloud/cloud-api");
+
+/** 构造一个记录请求并可返回预设响应的假 HTTPS 层。 */
+function makeRequester(responses) {
+  const calls = [];
+  const queue = [...responses];
+  return {
+    calls,
+    fn: async (request) => {
+      calls.push(request);
+      if (!queue.length) throw new Error("no more canned responses");
+      const next = queue.shift();
+      if (next instanceof Error) throw next;
+      return { status: next.status ?? 200, headers: {}, text: JSON.stringify(next.body) };
+    },
+  };
+}
+
+test("login returns tokens and never leaks them in the request log", async () => {
+  const requester = makeRequester([{ body: { accessToken: "tok", refreshToken: "ref", expiresIn: 7776000, loginType: "" } }]);
+  const api = new CloudApi({ region: "global", requestFn: requester.fn });
+  const result = await api.login({ account: "a@b.c", password: "pw" });
+
+  assert.equal(result.accessToken, "tok");
+  assert.equal(result.refreshToken, "ref");
+  assert.equal(result.expiresInSeconds, 7776000);
+  assert.equal(requester.calls[0].url, "https://api.bambulab.com/v1/user-service/user/login");
+  assert.equal(requester.calls[0].method, "POST");
+  assert.deepEqual(requester.calls[0].body, { account: "a@b.c", password: "pw", apiError: "" });
+  assert.deepEqual(requester.calls[0].headers, {});
+});
+
+test("login requires a verification code when the service asks for one", async () => {
+  const requester = makeRequester([{ body: { loginType: "verifyCode" } }]);
+  const api = new CloudApi({ region: "china", requestFn: requester.fn });
+  await assert.rejects(
+    () => api.login({ account: "a@b.c", password: "pw" }),
+    (error) => error instanceof CloudApiError && error.kind === ERROR_KINDS.verificationRequired,
+  );
+});
+
+test("email accounts request an email verification code", async () => {
+  const requester = makeRequester([{ body: { code: 0, message: "success" } }]);
+  const api = new CloudApi({ region: "global", requestFn: requester.fn });
+  const result = await api.requestVerificationCode("a@b.c");
+
+  assert.deepEqual(result, { codeSent: true, channel: "email", login: null });
+  assert.equal(requester.calls[0].url, "https://api.bambulab.com/v1/user-service/user/sendemail/code");
+  assert.deepEqual(requester.calls[0].body, { email: "a@b.c", type: "codeLogin" });
+});
+
+test("phone accounts request a China SMS verification code", async () => {
+  const requester = makeRequester([{ body: { code: 0, message: "success" } }]);
+  const api = new CloudApi({ region: "china", requestFn: requester.fn });
+  const result = await api.requestVerificationCode("13800138000");
+
+  assert.deepEqual(result, { codeSent: true, channel: "sms", login: null });
+  assert.equal(requester.calls[0].url, "https://api.bambulab.cn/v1/user-service/user/sendsmscode");
+  assert.deepEqual(requester.calls[0].body, { phone: "13800138000", type: "codeLogin" });
+});
+
+test("requestEmailCode remains a channel-aware compatibility alias", async () => {
+  const requester = makeRequester([{ body: { code: 0 } }]);
+  const api = new CloudApi({ region: "global", requestFn: requester.fn });
+  const result = await api.requestEmailCode("13800138000");
+  assert.equal(result.channel, "sms");
+});
+
+test("service errors are classified for the UI", () => {
+  assert.equal(classifyServiceError(400, { code: 1, error: "Incorrect account or password." }), ERROR_KINDS.invalidCredentials);
+  assert.equal(classifyServiceError(401, { code: 4, error: "Please login.", message: "" }), ERROR_KINDS.unauthorized);
+  assert.equal(classifyServiceError(429, {}), ERROR_KINDS.rateLimited);
+  assert.equal(classifyServiceError(400, { error: "Verification code expired" }), ERROR_KINDS.verificationInvalid);
+  assert.equal(classifyServiceError(400, { error: "Two-factor authentication required" }), ERROR_KINDS.twoFactorRequired);
+  assert.equal(classifyServiceError(400, { code: 1, error: "Enter a valid phone number." }), ERROR_KINDS.invalidPhone);
+  assert.equal(classifyServiceError(500, {}), ERROR_KINDS.unknown);
+});
+
+test("invalid credentials surface as a user readable message", async () => {
+  const requester = makeRequester([{ status: 400, body: { code: 1, error: "Incorrect account or password." } }]);
+  const api = new CloudApi({ region: "global", requestFn: requester.fn });
+  await assert.rejects(
+    () => api.login({ account: "a@b.c", password: "bad" }),
+    (error) => error.kind === ERROR_KINDS.invalidCredentials && error.message === "账号或密码错误",
+  );
+});
+
+test("network and timeout errors are classified", async () => {
+  const networkError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  const api = new CloudApi({ region: "global", requestFn: makeRequester([networkError]).fn });
+  await assert.rejects(
+    () => api.fetchDevices("tok"),
+    (error) => error.kind === ERROR_KINDS.network,
+  );
+
+  const timeoutError = Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+  const api2 = new CloudApi({ region: "global", requestFn: makeRequester([timeoutError]).fn });
+  await assert.rejects(
+    () => api2.fetchDevices("tok"),
+    (error) => error.kind === ERROR_KINDS.timeout,
+  );
+});
+
+test("fetchDevices strips access codes and keeps only needed fields", async () => {
+  const requester = makeRequester([
+    {
+      body: {
+        message: "success",
+        devices: [
+          {
+            dev_id: "DEV1",
+            name: "X1-01",
+            online: true,
+            print_status: "SUCCESS",
+            dev_model_name: "BL-P001",
+            dev_product_name: "X1 Carbon",
+            dev_access_code: "1234abcd",
+            nozzle_diameter: "0.4",
+          },
+          { name: "missing id" },
+        ],
+      },
+    },
+  ]);
+  const api = new CloudApi({ region: "global", requestFn: requester.fn });
+  const devices = await api.fetchDevices("tok");
+  assert.equal(devices.length, 1);
+  assert.deepEqual(devices[0], {
+    id: "DEV1",
+    name: "X1-01",
+    model: "X1 Carbon",
+    online: true,
+    printStatus: "SUCCESS",
+    nozzleDiameter: "0.4",
+  });
+  assert.ok(!JSON.stringify(devices).includes("1234abcd"));
+  assert.equal(requester.calls[0].headers.authorization, "Bearer tok");
+});
+
+test("fetchDevices rejects malformed payloads instead of reporting zero devices", async () => {
+  const api = new CloudApi({ region: "global", requestFn: makeRequester([{ body: { message: "success" } }]).fn });
+  await assert.rejects(
+    () => api.fetchDevices("tok"),
+    (error) => error.kind === ERROR_KINDS.deviceListUnavailable,
+  );
+});
+
+test("fetchUserId accepts numbers and numeric strings only", async () => {
+  const numeric = new CloudApi({ region: "global", requestFn: makeRequester([{ body: { uid: 12345 } }]).fn });
+  assert.equal(await numeric.fetchUserId("tok"), "12345");
+
+  const stringy = new CloudApi({ region: "global", requestFn: makeRequester([{ body: { uid: "6789" } }]).fn });
+  assert.equal(await stringy.fetchUserId("tok"), "6789");
+
+  const bad = new CloudApi({ region: "global", requestFn: makeRequester([{ body: { uid: "abc" } }]).fn });
+  await assert.rejects(() => bad.fetchUserId("tok"), /用户标识/);
+});
+
+test("request trace records no headers, bodies or tokens", async () => {
+  const requester = makeRequester([{ body: { message: "success", devices: [] } }]);
+  const events = [];
+  const api = new CloudApi({
+    region: "global",
+    requestFn: requester.fn,
+    onRequest: (event) => events.push(event),
+  });
+  await api.fetchDevices("super-secret-token");
+
+  assert.equal(events.length, 1);
+  assert.deepEqual(Object.keys(events[0]).sort(), ["durationMs", "kind", "method", "path", "status"]);
+  assert.equal(events[0].method, "GET");
+  assert.equal(events[0].path, "/v1/iot-service/api/user/bind");
+  assert.equal(events[0].status, 200);
+  assert.equal(events[0].kind, null);
+  assert.ok(Number.isFinite(events[0].durationMs));
+  assert.ok(!JSON.stringify(events[0]).includes("super-secret-token"));
+});
+
+test("request trace records the classified error kind without response details", async () => {
+  const requester = makeRequester([{ status: 401, body: { code: 4, error: "Please login." } }]);
+  const events = [];
+  const api = new CloudApi({
+    region: "global",
+    requestFn: requester.fn,
+    onRequest: (event) => events.push(event),
+  });
+  await assert.rejects(() => api.fetchDevices("tok"), (error) => error.kind === ERROR_KINDS.unauthorized);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].status, 401);
+  assert.equal(events[0].kind, ERROR_KINDS.unauthorized);
+  assert.ok(!JSON.stringify(events[0]).includes("Bearer"));
+});
+
+test("code login submits only account and code", async () => {
+  const requester = makeRequester([{ body: { accessToken: "tok" } }]);
+  const api = new CloudApi({ region: "china", requestFn: requester.fn });
+  await api.login({ account: "13800138000", code: "123456" });
+  assert.deepEqual(requester.calls[0].body, { account: "13800138000", code: "123456" });
+});

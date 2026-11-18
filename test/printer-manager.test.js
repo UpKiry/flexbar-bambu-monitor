@@ -1,0 +1,173 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { createPrinterManager } = require("../src/printer/printer-manager");
+const { CONNECTION_STATES } = require("../src/cloud/cloud-mqtt");
+
+/** 假云客户端：直接暴露 onStatus / onReport 的触发入口。 */
+function makeFakeMqttFactory() {
+  const created = [];
+  const factory = (options) => {
+    const statusHandler = { fn: null };
+    const reportHandler = { fn: null };
+    const instance = {
+      options,
+      started: false,
+      stopped: false,
+      onStatus(fn) { statusHandler.fn = fn; },
+      onReport(fn) { reportHandler.fn = fn; },
+      start() { instance.started = true; },
+      stop() { instance.stopped = true; },
+      requestFullState: () => ({ sent: true }),
+      emitStatus(status) { statusHandler.fn?.(status); },
+      emitReport(report) { reportHandler.fn?.(report); },
+    };
+    created.push(instance);
+    return instance;
+  };
+  return { factory, created };
+}
+
+function setup() {
+  const { factory, created } = makeFakeMqttFactory();
+  const warnings = [];
+  const manager = createPrinterManager({
+    createMqttClient: factory,
+    logger: { warn: (m) => warnings.push(m), info: () => {}, error: () => {} },
+    now: () => 5000,
+  });
+  return { manager, created, warnings };
+}
+
+test("selecting a printer without credentials does not connect", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  assert.equal(manager.printerId, "DEV1");
+  assert.equal(created.length, 0);
+  assert.equal(manager.state.connection, "disconnected");
+});
+
+test("connect wires the account credentials into the MQTT client", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  const result = manager.connect({ host: "us.mqtt.bambulab.com", port: 8883, userId: "42", accessToken: "tok" });
+
+  assert.equal(result.started, true);
+  assert.equal(created.length, 1);
+  assert.equal(created[0].options.host, "us.mqtt.bambulab.com");
+  assert.equal(created[0].options.username, "u_42");
+  assert.equal(created[0].options.password, "tok");
+  assert.equal(created[0].options.deviceId, "DEV1");
+  assert.equal(created[0].started, true);
+});
+
+test("connect without a selected printer is refused", () => {
+  const { manager, created } = setup();
+  const result = manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  assert.equal(result.started, false);
+  assert.equal(result.reason, "no-printer");
+  assert.equal(created.length, 0);
+});
+
+test("MQTT status transitions map to printer connection states", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+
+  created[0].emitStatus({ state: CONNECTION_STATES.connecting, attempt: 0, lastError: null, subscribed: false });
+  assert.equal(manager.state.connection, "connecting");
+
+  created[0].emitStatus({ state: CONNECTION_STATES.connected, attempt: 0, lastError: null, subscribed: true });
+  assert.equal(manager.state.connection, "connected");
+  assert.equal(manager.connected, true);
+
+  created[0].emitStatus({ state: CONNECTION_STATES.reconnecting, attempt: 2, lastError: null, subscribed: false });
+  assert.equal(manager.state.connection, "reconnecting");
+  assert.equal(manager.connected, false);
+
+  created[0].emitStatus({ state: CONNECTION_STATES.failed, attempt: 0, lastError: { message: "x" }, subscribed: false });
+  assert.equal(manager.state.connection, "error");
+});
+
+test("reports are merged into the printer state and listeners notified", () => {
+  const { manager, created } = setup();
+  const changes = [];
+  manager.subscribe((change) => changes.push(change));
+
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  created[0].emitReport({ raw: { gcode_state: "RUNNING", mc_percent: 30 }, receivedAt: 5000 });
+
+  assert.equal(manager.state.activity, "printing");
+  assert.equal(manager.state.progressPercent, 30);
+  assert.equal(manager.state.lastReportAt, 5000);
+  assert.ok(changes.some((change) => change.type === "report" && change.state.progressPercent === 30));
+});
+
+test("switching printers resets state and closes the old connection", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  created[0].emitReport({ raw: { gcode_state: "RUNNING", mc_percent: 30 } });
+
+  manager.selectPrinter("DEV2");
+  assert.equal(manager.printerId, "DEV2");
+  assert.equal(created[0].stopped, true);
+  assert.equal(manager.state.progressPercent, null);
+  assert.equal(manager.state.lastReportAt, null);
+});
+
+test("reconnecting to the same printer keeps its state", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  created[0].emitReport({ raw: { gcode_state: "RUNNING", mc_percent: 30 } });
+
+  manager.selectPrinter("DEV1");
+  assert.equal(manager.state.progressPercent, 30);
+});
+
+test("printer name updates are reported without resetting state", () => {
+  const { manager, created } = setup();
+  const changes = [];
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  created[0].emitReport({ raw: { gcode_state: "IDLE" } });
+  manager.subscribe((change) => changes.push(change));
+
+  manager.selectPrinter("DEV1", { name: "X1 Carbon" });
+  assert.equal(manager.printerName, "X1 Carbon");
+  assert.equal(manager.state.activity, "idle");
+  assert.ok(changes.some((change) => change.type === "printer" && change.printerName === "X1 Carbon"));
+});
+
+test("disconnect closes the connection and marks the state", () => {
+  const { manager, created } = setup();
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  manager.disconnect();
+  assert.equal(created[0].stopped, true);
+  assert.equal(manager.state.connection, "disconnected");
+});
+
+test("a throwing listener does not break dispatch", () => {
+  const { manager, warnings, created } = setup();
+  manager.subscribe(() => {
+    throw new Error("bad listener");
+  });
+  const seen = [];
+  manager.subscribe((change) => seen.push(change.type));
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  created[0].emitReport({ raw: { gcode_state: "IDLE" } });
+
+  assert.ok(warnings.some((line) => line.includes("bad listener")));
+  assert.ok(seen.includes("report"));
+});
+
+test("requestFullState is forwarded to the live client only", () => {
+  const { manager } = setup();
+  assert.equal(manager.requestFullState().sent, false);
+  manager.selectPrinter("DEV1");
+  manager.connect({ host: "h", port: 1, userId: "1", accessToken: "t" });
+  assert.deepEqual(manager.requestFullState(), { sent: true });
+});

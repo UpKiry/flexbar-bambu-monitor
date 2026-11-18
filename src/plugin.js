@@ -1,96 +1,49 @@
-const { plugin, logger, pluginPath, resourcesPath } = require("@eniac/flexdesigner")
-
-// Store key data
-const keyData = {}
-
-/**
- * Called when current active window changes
- * {
- *    "status": "changed",
- *    "oldWin": OldWindow,
- *    "newWin": NewWindow
- * }
- */
-plugin.on('system.actwin', (payload) => {
-    logger.info('Active window changed:', payload)
-})
+const path = require("node:path");
+const { plugin, logger } = require("@eniac/flexdesigner");
+const { createPluginRuntime } = require("./runtime");
+const { createAdminServer } = require("./admin/server");
 
 /**
- * Called when received message from UI send by this.$fd.sendToBackend
- * @param {object} payload message sent from UI
+ * FlexDesigner 入口（见 docs/云端监控设计方案.md §7）。
+ *
+ * 这里只做接线：事件注册、服务启动、生命周期收尾。协议细节都在各模块中，
+ * 以便脱离宿主环境做单元测试。
  */
-plugin.on('ui.message', async (payload) => {
-    logger.info('Received message from UI:', payload)
-    return 'Hello from plugin backend!'
-})
+const pluginDirectory = plugin.directory || path.join(__dirname, "..");
+const runtime = createPluginRuntime({ plugin, logger });
+const admin = createAdminServer({
+  runtime,
+  staticDir: path.join(pluginDirectory, "resources", "admin"),
+  logger,
+});
+runtime.attachAdmin(admin);
 
-/**
- * Called when device status changes
- * @param {object} devices device status data
- * [
- *  {
- *    serialNumber: '',
- *    deviceData: {
- *       platform: '',
- *       profileVersion: '',
- *       firmwareVersion: '',
- *       deviceName: '',
- *       displayName: ''
- *    }
- *  }
- * ]
- */
-plugin.on('device.status', (devices) => {
-    logger.info('Device status changed:', devices)
-})
+// 先连宿主：之后 runtime 才能读到配置、注册的事件也才会收到消息。
+plugin.start();
 
+runtime.start().catch((error) => {
+  logger.error(`Bambu Monitor 启动失败：${error?.message || error}`);
+});
 
-/**
- * Called when a plugin key is loaded
- * @param {Object} payload alive key data
- * {
- *  serialNumber: '',
- *  keys: []
- * }
- */
-plugin.on('plugin.alive', (payload) => {
-    logger.info('Plugin alive:', payload)
-    for (let key of payload.keys) {
-      keyData[key.uid] = key
-      if (key.cid === 'com.upkiry.bambumonitor.counter') {
-          keyData[key.uid].counter = parseInt(key.data.rangeMin)
-          key.style.showIcon = false
-          key.style.showTitle = true
-          key.title = 'Click Me!'
-          plugin.draw(payload.serialNumber, key, 'draw')
-      }
-    }
-})
+// 浏览器后台尽早启动，设置页点按钮时只需要拉起浏览器。
+// 启动失败不影响 Flexbar 监控，设置页会显示后台不可用。
+admin.start().catch((error) => {
+  logger.error(`浏览器后台启动失败：${error?.message || error}`);
+});
 
+// 进程退出时关闭本地后台并断开云端连接，避免留下监听端口或悬挂的 MQTT 会话。
+function shutdown() {
+  return runtime.shutdown().catch((error) => {
+    logger.error(`退出清理失败：${error?.message || error}`);
+  });
+}
+function shutdownAndExit() {
+  shutdown().finally(() => process.exit(0));
+}
+process.once("beforeExit", () => {
+  shutdown();
+});
+process.once("SIGINT", shutdownAndExit);
+process.once("SIGTERM", shutdownAndExit);
 
-/**
- * Called when user interacts with a key
- * @param {object} payload key data 
- * {
- *  serialNumber, 
- *  data
- * }
- */
-plugin.on('plugin.data', (payload) => {
-    logger.info('Received plugin.data:', payload)
-    const data = payload.data
-    if (data.key.cid === "com.upkiry.bambumonitor.counter") {
-      const key = data.key
-      key.style.showIcon = false
-      key.style.showTitle = true
-      keyData[key.uid].counter++
-      if (keyData[key.uid].counter > parseInt(key.data.rangeMax)) {
-          keyData[key.uid].counter = parseInt(key.data.rangeMin)
-      }
-      key.title = keyData[key.uid].counter.toString()
-      plugin.draw(payload.serialNumber, key, 'draw')
-    }
-})
-
-// Connect to flexdesigner and start the plugin
-plugin.start()
+module.exports = { runtime, admin };

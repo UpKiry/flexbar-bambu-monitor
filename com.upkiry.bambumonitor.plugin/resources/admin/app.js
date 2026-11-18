@@ -1,0 +1,958 @@
+"use strict";
+
+/**
+ * Bambu Monitor 本机浏览器后台。
+ *
+ * 这是一个无构建的静态页面：只通过同源 fetch 调用插件后台的 /api/*，
+ * 不直接访问 Bambu 云，也不把令牌写进 localStorage。
+ */
+(function () {
+  const TOKEN_KEY = "bambu-monitor-admin-token";
+  const STATUS_POLL_MS = 1_000;
+  const DIAGNOSTICS_POLL_MS = 2_500;
+  const ACTION_BUTTON_IDS = [
+    "refresh-btn",
+    "login-btn",
+    "send-code-btn",
+    "logout-btn",
+    "refresh-devices-btn",
+    "test-connection-btn",
+    "full-state-btn",
+    "refresh-diag-btn",
+  ];
+
+  const state = {
+    token: "",
+    status: null,
+    diagnostics: null,
+    awaitingCode: false,
+    busy: false,
+    statusTimer: null,
+    diagnosticsTimer: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  function setText(id, value) {
+    const node = $(id);
+    if (node) node.textContent = value === undefined || value === null ? "" : String(value);
+  }
+
+  function setHidden(id, hidden) {
+    const node = $(id);
+    if (node) node.hidden = Boolean(hidden);
+  }
+
+  function clear(node) {
+    if (!node) return;
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function create(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  // ---------------------------------------------------------------------
+  // 令牌
+  // ---------------------------------------------------------------------
+
+  function readHashToken() {
+    const raw = location.hash.replace(/^#/, "");
+    if (!raw) return "";
+    try {
+      return new URLSearchParams(raw).get("token") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function storedToken() {
+    try {
+      return sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function persistToken(token) {
+    try {
+      sessionStorage.setItem(TOKEN_KEY, token);
+    } catch {
+      // 隐私模式下 sessionStorage 不可用时，退化为仅当前页面内存。
+    }
+  }
+
+  function clearStoredToken() {
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  function stripTokenFromAddress() {
+    if (!location.hash) return;
+    try {
+      history.replaceState(null, "", location.pathname + location.search);
+    } catch {
+      // ignore
+    }
+  }
+
+  function extractToken(value) {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    try {
+      if (text.includes("#token=")) return decodeURIComponent(text.split("#token=")[1]);
+      if (/^https?:\/\//i.test(text)) {
+        const parsed = new URL(text);
+        return new URLSearchParams(parsed.hash.replace(/^#/, "")).get("token") || "";
+      }
+    } catch {
+      return "";
+    }
+    return text;
+  }
+
+  // ---------------------------------------------------------------------
+  // 请求
+  // ---------------------------------------------------------------------
+
+  async function api(path, { method = "GET", body } = {}) {
+    const headers = { Authorization: `Bearer ${state.token}` };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const response = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "omit",
+    });
+
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    if (response.status === 401) {
+      showTokenScreen("后台令牌无效或已过期，请从 FlexDesigner 设置页重新点击「进入后台」。");
+      throw new Error("后台令牌无效");
+    }
+    if (!response.ok) {
+      throw new Error(data.message || `请求失败（HTTP ${response.status}）`);
+    }
+    return data;
+  }
+
+  // ---------------------------------------------------------------------
+  // 页面状态
+  // ---------------------------------------------------------------------
+
+  function showMessage(text, type = "") {
+    const node = $("message");
+    if (!node) return;
+    if (!text) {
+      node.hidden = true;
+      node.textContent = "";
+      return;
+    }
+    node.hidden = false;
+    node.className = `message${type ? ` ${type}` : ""}`;
+    node.textContent = text;
+  }
+
+  function showBanner(text, type = "") {
+    const node = $("banner");
+    if (!node) return;
+    if (!text) {
+      node.hidden = true;
+      node.textContent = "";
+      return;
+    }
+    node.hidden = false;
+    node.className = `banner${type ? ` ${type}` : ""}`;
+    node.textContent = text;
+  }
+
+  function setBusy(busy) {
+    state.busy = Boolean(busy);
+    for (const id of ACTION_BUTTON_IDS) {
+      const node = $(id);
+      if (node) node.disabled = state.busy;
+    }
+    const region = $("region-select");
+    const printer = $("printer-select");
+    if (region) region.disabled = state.busy || Boolean(state.status?.auth?.state === "signed-in");
+    if (printer) printer.disabled = state.busy;
+  }
+
+  function setPill(text, className) {
+    const node = $("auth-pill");
+    if (!node) return;
+    node.textContent = text;
+    node.className = `pill ${className}`;
+  }
+
+  function startPolling() {
+    stopPolling();
+    state.statusTimer = setInterval(() => {
+      if (!document.hidden && state.token && !state.busy) loadStatus({ silent: true });
+    }, STATUS_POLL_MS);
+    state.diagnosticsTimer = setInterval(() => {
+      if (!document.hidden && state.token) loadDiagnostics({ silent: true });
+    }, DIAGNOSTICS_POLL_MS);
+  }
+
+  function stopPolling() {
+    if (state.statusTimer) clearInterval(state.statusTimer);
+    if (state.diagnosticsTimer) clearInterval(state.diagnosticsTimer);
+    state.statusTimer = null;
+    state.diagnosticsTimer = null;
+  }
+
+  async function loadStatus({ silent = false } = {}) {
+    if (!state.token) return;
+    try {
+      const data = await api("/api/status");
+      state.status = data;
+      renderStatus(data);
+      if (!silent) showMessage("状态已刷新", "success");
+    } catch (error) {
+      if (!silent && state.token) showMessage(error.message, "error");
+    }
+  }
+
+  async function loadDiagnostics({ silent = false } = {}) {
+    if (!state.token) return;
+    try {
+      const data = await api("/api/diagnostics");
+      state.diagnostics = data;
+      renderDiagnostics(data);
+      if (!silent) showMessage("诊断信息已刷新", "success");
+    } catch (error) {
+      if (!silent && state.token) showMessage(error.message, "error");
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 渲染
+  // ---------------------------------------------------------------------
+
+  function currentRegion() {
+    return state.status?.config?.region || "global";
+  }
+
+  function accountKindError(account) {
+    const region = currentRegion();
+    const hasEmail = typeof account === "string" && account.includes("@");
+    if (region === "china" && hasEmail) return "中国大陆账号只能使用手机号登录";
+    if (region !== "china" && !hasEmail) return "全球账号请使用邮箱登录";
+    return "";
+  }
+
+  function renderAccountField(region) {
+    const china = region === "china";
+    const label = $("account-label");
+    if (label) label.textContent = china ? "Bambu 账号（手机号）" : "Bambu 账号（邮箱）";
+    const input = $("account-input");
+    if (input) {
+      input.type = china ? "tel" : "email";
+      input.autocomplete = china ? "tel" : "username";
+      input.inputMode = china ? "tel" : "email";
+      input.placeholder = china ? "例如 +86 13800138000" : "name@example.com";
+    }
+    const hint = $("account-hint");
+    if (hint) {
+      hint.textContent = china
+        ? "中国大陆账号使用手机号登录，验证码通过短信发送。"
+        : "全球账号使用邮箱登录，验证码通过邮件发送。";
+    }
+  }
+
+  function renderStatus(data) {
+    const auth = data.auth || {};
+    const config = data.config || {};
+    const signedIn = auth.state === "signed-in";
+    const expired = auth.state === "expired";
+
+    if (signedIn) setPill("已登录", "signed-in");
+    else if (expired) setPill("登录已失效", "expired");
+    else setPill("未登录", "muted");
+
+    const regionLabel = labelForRegion(config.region, data.regions);
+    setText("region-badge", regionLabel);
+
+    setHidden("login-form", signedIn);
+    setHidden("signed-in-panel", !signedIn);
+    if (signedIn) {
+      state.awaitingCode = false;
+      setText("account-state", "已登录");
+      setText("account-uid", auth.userId || "—");
+      setText("account-expiry", formatDateTime(auth.expiresAt));
+    } else {
+      setText("account-state", expired ? "登录已失效" : "未登录");
+      setText("account-uid", "—");
+      setText("account-expiry", "—");
+    }
+
+    const credential = data.credentialStore || {};
+    setText("credential-store", credential.available
+      ? `系统安全存储可用（${credential.backend || "system"}）`
+      : `仅内存保存（${credential.reason || "安全存储不可用"}）`);
+
+    renderRegionSelect(data.regions, config.region, signedIn);
+    renderBanner(data, signedIn, expired);
+    renderDevices(data, signedIn);
+    renderPreview(data.display);
+    renderSnapshot(data);
+    renderLoginMode();
+    setBusy(state.busy);
+    setText("admin-port", data.admin?.port ? `本地端口 ${data.admin.port}` : "");
+  }
+
+  function renderBanner(data, signedIn, expired) {
+    const messages = [];
+    let level = "warning";
+    if (expired) {
+      messages.push("登录已失效，请在下方重新登录。");
+      level = "error";
+    }
+    if (data.auth?.error?.message) {
+      messages.push(data.auth.error.message);
+      level = "error";
+    }
+    if (data.credentialStore?.available === false) {
+      messages.push("系统安全存储不可用：登录状态只保留到插件重启为止。");
+    }
+    if (data.devicesError) {
+      messages.push(`读取设备列表失败：${data.devicesError}`);
+    }
+    if (!signedIn && data.admin && data.admin.running === false) {
+      messages.push("本地后台未运行，请回到 FlexDesigner 设置页重新进入。");
+    }
+    if (!messages.length) {
+      showBanner("", "");
+      return;
+    }
+    showBanner(messages.join("；"), level);
+  }
+
+  function renderRegionSelect(regions, current, signedIn) {
+    const select = $("region-select");
+    if (!select) return;
+    const items = Array.isArray(regions) && regions.length ? regions : [
+      { id: "global", label: "全球" },
+      { id: "china", label: "中国大陆" },
+    ];
+    const signature = items.map((item) => item.id).join(",");
+    if (select.dataset.signature !== signature) {
+      clear(select);
+      for (const item of items) {
+        const option = create("option", "", item.label);
+        option.value = item.id;
+        select.appendChild(option);
+      }
+      select.dataset.signature = signature;
+    }
+    select.value = current || "global";
+    select.disabled = state.busy || signedIn;
+    setText("region-hint", signedIn
+      ? "退出登录后才能切换区域。"
+      : current === "china"
+        ? "中国大陆账号只能使用手机号登录，验证码通过短信发送。"
+        : "全球账号使用邮箱登录，验证码通过邮件发送；区域选错会登录失败。");
+    renderAccountField(current || "global");
+  }
+
+  function renderLoginMode() {
+    const awaiting = state.awaitingCode;
+    const channel = currentRegion() === "china" ? "短信" : "邮箱";
+    setHidden("password-field", awaiting);
+    setHidden("code-field", !awaiting);
+    setText("login-btn", awaiting ? "提交验证码" : "登录");
+    setText("send-code-btn", awaiting ? `重新发送${channel}验证码` : `发送${channel}验证码`);
+    setHidden("switch-password-btn", !awaiting);
+  }
+
+  function renderDevices(data, signedIn) {
+    const devices = Array.isArray(data.devices) ? data.devices : [];
+    const selected = data.config?.printerId || "";
+    const hasSelection = Boolean(selected);
+    const showPanel = signedIn && (devices.length > 0 || hasSelection);
+
+    setHidden("device-empty", showPanel);
+    setHidden("device-panel", !showPanel);
+
+    if (!showPanel) {
+      if (!signedIn) setText("device-empty", "登录后可以读取账号下绑定的打印机。");
+      else if (data.devicesError) setText("device-empty", `读取设备列表失败：${data.devicesError}`);
+      else setText("device-empty", "账号下没有绑定打印机，请先在 Bambu 应用或 Bambu Studio 中绑定设备。");
+      setText("link-state", "未连接");
+      return;
+    }
+
+    const select = $("printer-select");
+    const selectedMissing = hasSelection && !devices.some((device) => device.id === selected);
+    const signature = `${devices.map((device) => device.id).join(",")}|${selectedMissing ? selected : ""}`;
+    if (select.dataset.signature !== signature) {
+      clear(select);
+      const none = create("option", "", "不监控任何设备");
+      none.value = "";
+      select.appendChild(none);
+      for (const device of devices) {
+        const suffix = device.online ? "（在线）" : "（离线）";
+        const model = device.model ? ` · ${device.model}` : "";
+        const option = create("option", "", `${device.name || device.id}${model}${suffix}`);
+        option.value = device.id;
+        select.appendChild(option);
+      }
+      if (selectedMissing) {
+        const option = create("option", "", `当前选择（${selected}，不在设备列表中）`);
+        option.value = selected;
+        select.appendChild(option);
+      }
+      select.dataset.signature = signature;
+    }
+    select.value = selected;
+    select.disabled = state.busy;
+
+    const count = devices.length;
+    setText("device-hint", data.devicesError
+      ? data.devicesError
+      : count
+        ? `共 ${count} 台设备，只监控当前选中的一台。`
+        : "设备列表暂不可用，但仍显示当前选择的打印机。");
+
+    const printer = data.printer || {};
+    const link = printer.link || {};
+    const linkState = link.state || "idle";
+    const linkText = labelForLink(linkState, link);
+    setText("link-state", linkText);
+    const linkNode = $("link-state");
+    if (linkNode) linkNode.className = `link-${linkState}`;
+
+    const printerState = printer.state || {};
+    setText("last-report", printerState.lastReportAt
+      ? `${formatTime(printerState.lastReportAt)}（${formatAge(printerState.lastReportAt)}）`
+      : "尚未收到");
+    setText("activity", labelForActivity(printerState.activity, printerState.rawActivity));
+    setText("task-name", printerState.taskName || "—");
+    setText("progress-text", formatPercent(printerState.progressPercent));
+    setText("remaining-text", formatMinutes(printerState.remainingMinutes));
+    setText("nozzle-text", formatTemperature(printerState.nozzle));
+    setText("bed-text", formatTemperature(printerState.bed));
+    setText("error-code", printerState.errorCode || "—");
+
+    const progress = $("progress-bar");
+    if (progress) {
+      if (typeof printerState.progressPercent === "number" && Number.isFinite(printerState.progressPercent)) {
+        progress.hidden = false;
+        progress.value = Math.max(0, Math.min(100, printerState.progressPercent));
+      } else {
+        progress.hidden = true;
+      }
+    }
+  }
+
+  function renderPreview(display) {
+    const preview = $("display-preview");
+    if (!preview) return;
+    const tone = ["muted", "normal", "positive", "warning", "critical"].includes(display?.tone)
+      ? display.tone
+      : "muted";
+    preview.className = `preview tone-${tone}`;
+    setText("preview-title", display?.title || "—");
+    setText("preview-subtitle", display?.subtitle || "—");
+  }
+
+  function renderSnapshot(data) {
+    const snapshot = {
+      auth: data.auth,
+      config: data.config,
+      credentialStore: data.credentialStore,
+      devices: data.devices,
+      devicesError: data.devicesError,
+      printer: data.printer,
+      display: data.display,
+      views: data.views,
+      admin: data.admin,
+    };
+    const text = JSON.stringify(snapshot, null, 2);
+    const node = $("snapshot");
+    if (node && node.textContent !== text) node.textContent = text;
+  }
+
+  function renderDiagnostics(data) {
+    const requests = Array.isArray(data.requests) ? data.requests : [];
+    const tbody = $("requests-body");
+    if (tbody) {
+      clear(tbody);
+      for (const request of requests) {
+        const row = create("tr");
+        row.appendChild(create("td", "", formatTime(request.at)));
+        row.appendChild(create("td", "", request.method || "—"));
+        row.appendChild(create("td", "", request.path || "—"));
+        row.appendChild(create("td", "", request.status === null || request.status === undefined ? "—" : request.status));
+        row.appendChild(create("td", "", request.kind || "—"));
+        row.appendChild(create("td", "", formatDuration(request.durationMs)));
+        tbody.appendChild(row);
+      }
+    }
+    setHidden("requests-empty", requests.length > 0);
+
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    const list = $("logs-list");
+    if (list) {
+      clear(list);
+      for (const entry of logs) {
+        const item = create("li");
+        item.appendChild(create("span", "log-time", formatTime(entry.at)));
+        item.appendChild(create("span", `log-level ${entry.level || "info"}`, entry.level || "info"));
+        item.appendChild(create("span", "log-message", entry.message || ""));
+        list.appendChild(item);
+      }
+    }
+    setHidden("logs-empty", logs.length > 0);
+  }
+
+  // ---------------------------------------------------------------------
+  // 操作
+  // ---------------------------------------------------------------------
+
+  async function runAction(action, payload = {}) {
+    if (!state.token || state.busy) return null;
+    setBusy(true);
+    try {
+      const response = await api("/api/action", {
+        method: "POST",
+        body: { action, payload },
+      });
+      const result = response.result || {};
+      handleActionResult(action, result);
+      await loadStatus({ silent: true });
+      await loadDiagnostics({ silent: true });
+      return result;
+    } catch (error) {
+      if (state.token) showMessage(error.message, "error");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleActionResult(action, result) {
+    const status = result?.status;
+    if (status === "code-required") {
+      state.awaitingCode = true;
+      renderLoginMode();
+      showMessage(result.message || "请输入邮箱验证码", "warning");
+      const password = $("password-input");
+      if (password) password.value = "";
+      const code = $("code-input");
+      if (code) code.focus();
+      return;
+    }
+    if (status === "code-sent") {
+      state.awaitingCode = true;
+      renderLoginMode();
+      showMessage(result.message || "验证码已发送，请查收邮箱", "success");
+      const code = $("code-input");
+      if (code) code.focus();
+      return;
+    }
+    if (status === "unsupported") {
+      showMessage(result.message || "该账号需要双重认证，当前版本尚不支持", "error");
+      return;
+    }
+    if (status === "error" || status === "failed") {
+      showMessage(result.message || "操作失败", "error");
+      return;
+    }
+    if (status === "busy") {
+      showMessage(result.message || "正在处理，请稍候", "warning");
+      return;
+    }
+    if (status === "success") {
+      if (action === "login") {
+        state.awaitingCode = false;
+        const password = $("password-input");
+        const code = $("code-input");
+        if (password) password.value = "";
+        if (code) code.value = "";
+      }
+      if (action === "logout") {
+        state.awaitingCode = false;
+        const password = $("password-input");
+        const code = $("code-input");
+        if (password) password.value = "";
+        if (code) code.value = "";
+      }
+      showMessage(messageForAction(action, result), "success");
+      return;
+    }
+    if (action === "requestFullState" && result?.sent === false) {
+      showMessage("当前未连接云端，无法请求完整状态。", "warning");
+      return;
+    }
+    showMessage(result?.message || "操作完成", "");
+  }
+
+  function messageForAction(action, result) {
+    switch (action) {
+      case "login": return "登录成功";
+      case "logout": return "已退出登录";
+      case "refreshDevices": return `已刷新设备列表（${Array.isArray(result?.devices) ? result.devices.length : 0} 台）`;
+      case "setPrinter": return "已更新要显示的打印机";
+      case "setRegion": return "账号区域已更新";
+      case "requestFullState": return result?.sent ? "已请求完整状态" : "请求完整状态失败";
+      case "testConnection": return result?.message || "连接测试完成";
+      default: return "操作完成";
+    }
+  }
+
+  async function submitLogin(event) {
+    event.preventDefault();
+    const accountNode = $("account-input");
+    const passwordNode = $("password-input");
+    const codeNode = $("code-input");
+    const account = accountNode ? accountNode.value.trim() : "";
+    const password = passwordNode ? passwordNode.value : "";
+    const code = codeNode ? codeNode.value.trim() : "";
+
+    if (!account) {
+      showMessage(currentRegion() === "china" ? "请先填写 Bambu 账号手机号" : "请先填写 Bambu 账号邮箱", "error");
+      return;
+    }
+    const kindError = accountKindError(account);
+    if (kindError) {
+      showMessage(kindError, "error");
+      return;
+    }
+    if (state.awaitingCode && !code) {
+      showMessage("请输入验证码", "error");
+      return;
+    }
+    if (!state.awaitingCode && !password) {
+      showMessage("请输入密码，或先发送验证码", "error");
+      return;
+    }
+
+    const result = await runAction("login", state.awaitingCode ? { account, code } : { account, password });
+    // 无论成功失败，都不在输入框里保留密码和验证码。
+    if (passwordNode) passwordNode.value = "";
+    if (codeNode) codeNode.value = "";
+    if (result?.status === "success") {
+      state.awaitingCode = false;
+      renderLoginMode();
+    }
+  }
+
+  async function sendCode() {
+    const accountNode = $("account-input");
+    const account = accountNode ? accountNode.value.trim() : "";
+    if (!account) {
+      showMessage(currentRegion() === "china" ? "请先填写 Bambu 账号手机号" : "请先填写 Bambu 账号邮箱", "error");
+      return;
+    }
+    const kindError = accountKindError(account);
+    if (kindError) {
+      showMessage(kindError, "error");
+      return;
+    }
+    const result = await runAction("requestCode", { account });
+    if (result?.status === "code-sent" || result?.status === "code-required") {
+      state.awaitingCode = true;
+      renderLoginMode();
+      const code = $("code-input");
+      if (code) code.focus();
+    }
+    if (result?.status === "success") {
+      state.awaitingCode = false;
+      renderLoginMode();
+    }
+  }
+
+  async function logout() {
+    if (!window.confirm("退出登录后需要重新输入账号密码，确定吗？")) return;
+    const result = await runAction("logout");
+    if (result?.status === "success") {
+      state.awaitingCode = false;
+      const password = $("password-input");
+      const code = $("code-input");
+      if (password) password.value = "";
+      if (code) code.value = "";
+      renderLoginMode();
+    }
+  }
+
+  async function setRegion() {
+    const select = $("region-select");
+    if (!select) return;
+    const region = select.value;
+    const previous = state.status?.config?.region;
+    if (!region || region === previous) return;
+    const result = await runAction("setRegion", { region });
+    if (result?.status !== "success") {
+      select.value = previous || "global";
+      return;
+    }
+    state.awaitingCode = false;
+    const account = $("account-input");
+    const password = $("password-input");
+    const code = $("code-input");
+    if (account) account.value = "";
+    if (password) password.value = "";
+    if (code) code.value = "";
+    renderLoginMode();
+  }
+
+  async function setPrinter() {
+    const select = $("printer-select");
+    if (!select) return;
+    const printerId = select.value;
+    const previous = state.status?.config?.printerId || "";
+    if (printerId === previous) return;
+    const result = await runAction("setPrinter", { printerId });
+    if (result?.status !== "success") {
+      select.value = previous;
+      return;
+    }
+    // 连接状态在后台异步变化，稍后再读一次。
+    setTimeout(() => loadStatus({ silent: true }), 1_500);
+  }
+
+  // ---------------------------------------------------------------------
+  // 诊断
+  // ---------------------------------------------------------------------
+
+  function diagnosticExport() {
+    const status = state.status || {};
+    return {
+      generatedAt: new Date().toISOString(),
+      status: {
+        auth: status.auth,
+        config: status.config,
+        credentialStore: status.credentialStore,
+        devices: status.devices,
+        devicesError: status.devicesError,
+        printer: status.printer,
+        display: status.display,
+        views: status.views,
+        admin: status.admin,
+      },
+      diagnostics: state.diagnostics
+        ? { logs: state.diagnostics.logs, requests: state.diagnostics.requests }
+        : null,
+    };
+  }
+
+  async function copyDiagnostics() {
+    const text = JSON.stringify(diagnosticExport(), null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      showMessage("诊断信息已复制（不含令牌）", "success");
+      return;
+    } catch {
+      // 回退到隐藏 textarea + execCommand。
+    }
+
+    const fallback = $("copy-fallback");
+    if (!fallback) {
+      showMessage("无法复制诊断信息，请展开状态快照手动复制。", "error");
+      return;
+    }
+    fallback.hidden = false;
+    fallback.value = text;
+    fallback.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    fallback.hidden = true;
+    showMessage(copied ? "诊断信息已复制（不含令牌）" : "无法复制诊断信息，请展开状态快照手动复制。", copied ? "success" : "error");
+  }
+
+  // ---------------------------------------------------------------------
+  // 格式化
+  // ---------------------------------------------------------------------
+
+  function formatTime(timestamp) {
+    if (!Number.isFinite(timestamp)) return "—";
+    try {
+      return new Date(timestamp).toLocaleTimeString("zh-CN", { hour12: false });
+    } catch {
+      return "—";
+    }
+  }
+
+  function formatDateTime(timestamp) {
+    if (!Number.isFinite(timestamp)) return "—";
+    try {
+      return new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
+    } catch {
+      return "—";
+    }
+  }
+
+  function formatAge(timestamp) {
+    if (!Number.isFinite(timestamp)) return "—";
+    const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+    if (seconds < 60) return `${seconds} 秒前`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    return `${Math.floor(hours / 24)} 天前`;
+  }
+
+  function formatDuration(durationMs) {
+    if (!Number.isFinite(durationMs)) return "—";
+    if (durationMs < 1000) return `${Math.round(durationMs)} ms`;
+    return `${(durationMs / 1000).toFixed(1)} s`;
+  }
+
+  function formatPercent(value) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+    return `${Math.round(value)}%`;
+  }
+
+  function formatMinutes(minutes) {
+    if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes < 0) return "—";
+    if (minutes < 60) return `${Math.round(minutes)} 分钟`;
+    const hours = Math.floor(minutes / 60);
+    const rest = Math.round(minutes % 60);
+    return rest === 0 ? `${hours} 小时` : `${hours} 小时 ${rest} 分`;
+  }
+
+  function formatTemperature(sensor) {
+    if (!sensor) return "—";
+    const current = typeof sensor.current === "number" ? `${Math.round(sensor.current)}℃` : "—";
+    if (typeof sensor.target !== "number") return current;
+    return `${current} → ${Math.round(sensor.target)}℃`;
+  }
+
+  function labelForActivity(activity, rawActivity) {
+    const labels = {
+      idle: "空闲",
+      preparing: "准备中",
+      printing: "打印中",
+      paused: "已暂停",
+      finished: "打印完成",
+      failed: "打印异常",
+      unknown: "未知",
+    };
+    if (activity && labels[activity]) return labels[activity];
+    return rawActivity ? `未知（原始值 ${rawActivity}）` : "未知";
+  }
+
+  function labelForLink(linkState, link) {
+    if (linkState === "connected") return "云端连接正常";
+    if (linkState === "connecting") return "正在连接云端";
+    if (linkState === "reconnecting") return `连接中断，正在重连${link?.attempt ? `（第 ${link.attempt} 次）` : ""}`;
+    if (linkState === "failed") return link?.lastError?.message || "云端连接失败";
+    return "未连接";
+  }
+
+  function labelForRegion(regionId, regions) {
+    const items = Array.isArray(regions) ? regions : [];
+    const found = items.find((item) => item.id === regionId);
+    if (found) return found.label;
+    if (regionId === "global") return "全球";
+    if (regionId === "china") return "中国大陆";
+    return "区域未知";
+  }
+
+  // ---------------------------------------------------------------------
+  // 初始化
+  // ---------------------------------------------------------------------
+
+  function showApp() {
+    setHidden("token-missing", true);
+    setHidden("app", false);
+  }
+
+  function showTokenScreen(message) {
+    stopPolling();
+    state.token = "";
+    clearStoredToken();
+    setHidden("app", true);
+    setHidden("token-missing", false);
+    const node = $("token-message");
+    if (node && message) node.textContent = message;
+  }
+
+  function bindEvents() {
+    $("manual-token-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = $("manual-token");
+      const token = extractToken(input ? input.value : "");
+      if (!token) {
+        const node = $("token-message");
+        if (node) node.textContent = "没有识别到有效令牌，请重新粘贴。";
+        return;
+      }
+      state.token = token;
+      persistToken(token);
+      stripTokenFromAddress();
+      if (input) input.value = "";
+      showApp();
+      loadStatus();
+      loadDiagnostics();
+      startPolling();
+    });
+
+    $("login-form").addEventListener("submit", submitLogin);
+    $("send-code-btn").addEventListener("click", sendCode);
+    $("switch-password-btn").addEventListener("click", () => {
+      state.awaitingCode = false;
+      renderLoginMode();
+      const password = $("password-input");
+      if (password) password.focus();
+    });
+    $("logout-btn").addEventListener("click", logout);
+    $("region-select").addEventListener("change", setRegion);
+    $("printer-select").addEventListener("change", setPrinter);
+
+    $("refresh-btn").addEventListener("click", () => {
+      loadStatus();
+      loadDiagnostics({ silent: true });
+    });
+    $("refresh-devices-btn").addEventListener("click", () => runAction("refreshDevices"));
+    $("test-connection-btn").addEventListener("click", () => runAction("testConnection"));
+    $("full-state-btn").addEventListener("click", () => runAction("requestFullState"));
+    $("refresh-diag-btn").addEventListener("click", () => loadDiagnostics());
+    $("copy-diag-btn").addEventListener("click", copyDiagnostics);
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && state.token) {
+        loadStatus({ silent: true });
+        loadDiagnostics({ silent: true });
+      }
+    });
+  }
+
+  function init() {
+    bindEvents();
+    const token = readHashToken() || storedToken();
+    if (!token) {
+      showTokenScreen();
+      return;
+    }
+    state.token = token;
+    persistToken(token);
+    stripTokenFromAddress();
+    showApp();
+    loadStatus();
+    loadDiagnostics();
+    startPolling();
+  }
+
+  init();
+})();

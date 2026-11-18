@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bambu Monitor 后台</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <section id="token-missing" class="token-screen" hidden>
+      <div class="token-card">
+        <h1>Bambu Monitor 后台</h1>
+        <p id="token-message">没有找到后台令牌。请打开 FlexDesigner 的插件设置，点击「进入后台」重新进入。</p>
+        <form id="manual-token-form" class="token-form">
+          <label for="manual-token">也可以粘贴设置页显示的后台地址或令牌</label>
+          <input id="manual-token" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴后台令牌">
+          <button type="submit">使用令牌</button>
+        </form>
+      </div>
+    </section>
+
+    <div id="app" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">B</span>
+          <div>
+            <h1>Bambu Monitor 后台</h1>
+            <p class="subtitle">登录、选择打印机与诊断都在这里完成</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span id="auth-pill" class="pill muted">读取中</span>
+          <button id="refresh-btn" type="button" class="secondary">刷新</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <div id="banner" class="banner" hidden></div>
+        <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+
+        <section class="card account-card">
+          <div class="card-head">
+            <h2>账号</h2>
+            <span id="region-badge" class="badge">区域未知</span>
+          </div>
+
+          <div id="signed-in-panel" hidden>
+            <dl class="facts">
+              <div><dt>状态</dt><dd id="account-state">已登录</dd></div>
+              <div><dt>用户标识</dt><dd id="account-uid">—</dd></div>
+              <div><dt>会话有效期</dt><dd id="account-expiry">—</dd></div>
+              <div><dt>凭据存储</dt><dd id="credential-store">—</dd></div>
+            </dl>
+            <div class="actions">
+              <button id="logout-btn" type="button" class="danger">退出登录</button>
+            </div>
+          </div>
+
+          <form id="login-form" autocomplete="on">
+            <div class="field">
+              <label for="region-select">账号区域</label>
+              <select id="region-select"></select>
+              <p id="region-hint" class="hint">必须与 Bambu 账号所属区域一致，选错会登录失败。</p>
+            </div>
+
+            <div class="field">
+              <label id="account-label" for="account-input">Bambu 账号（邮箱）</label>
+              <input id="account-input" type="email" autocomplete="username" spellcheck="false" required>
+              <p id="account-hint" class="hint">全球账号使用邮箱登录；中国大陆账号使用手机号登录。</p>
+            </div>
+
+            <div id="password-field" class="field">
+              <label for="password-input">密码</label>
+              <input id="password-input" type="password" autocomplete="current-password">
+            </div>
+
+            <div id="code-field" class="field" hidden>
+              <label for="code-input">邮箱验证码</label>
+              <input id="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" spellcheck="false">
+              <p class="hint">验证码会发送到账号邮箱。若没有收到，可以重新发送。</p>
+            </div>
+
+            <div class="actions">
+              <button id="login-btn" type="submit" class="primary">登录</button>
+              <button id="send-code-btn" type="button" class="secondary">发送验证码</button>
+              <button id="switch-password-btn" type="button" class="linkish" hidden>改用密码登录</button>
+            </div>
+            <p class="hint">密码和验证码只用于本次登录，不会保存；令牌写入系统安全存储或仅保留在内存中。中国大陆账号需要短信验证码，全球账号需要邮箱验证码。</p>
+          </form>
+        </section>
+
+        <section class="card device-card">
+          <div class="card-head">
+            <h2>打印机</h2>
+            <div class="actions compact">
+              <button id="refresh-devices-btn" type="button" class="secondary">刷新设备</button>
+              <button id="test-connection-btn" type="button" class="secondary">测试连接</button>
+            </div>
+          </div>
+
+          <div id="device-empty" class="empty">登录后可以读取账号下绑定的打印机。</div>
+
+          <div id="device-panel" hidden>
+            <div class="field">
+              <label for="printer-select">要显示的打印机</label>
+              <select id="printer-select"></select>
+              <p id="device-hint" class="hint"></p>
+            </div>
+
+            <dl class="facts">
+              <div><dt>云端连接</dt><dd id="link-state">未连接</dd></div>
+              <div><dt>最近报文</dt><dd id="last-report">—</dd></div>
+              <div><dt>状态</dt><dd id="activity">—</dd></div>
+              <div><dt>任务</dt><dd id="task-name">—</dd></div>
+              <div><dt>进度</dt><dd id="progress-text">—</dd></div>
+              <div><dt>剩余</dt><dd id="remaining-text">—</dd></div>
+              <div><dt>喷嘴</dt><dd id="nozzle-text">—</dd></div>
+              <div><dt>热床</dt><dd id="bed-text">—</dd></div>
+              <div><dt>错误码</dt><dd id="error-code">—</dd></div>
+            </dl>
+            <progress id="progress-bar" max="100" value="0" hidden></progress>
+
+            <div class="actions">
+              <button id="full-state-btn" type="button" class="secondary">请求完整状态</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="card preview-card">
+          <div class="card-head">
+            <h2>Flexbar 按键预览</h2>
+            <span id="preview-view" class="badge">进度视图</span>
+          </div>
+          <div id="display-preview" class="preview tone-muted">
+            <div id="preview-title" class="preview-title">—</div>
+            <div id="preview-subtitle" class="preview-subtitle">—</div>
+          </div>
+          <p class="hint">只预览后台生成的展示模型，实际按键绘制仍以 Flexbar 为准。</p>
+        </section>
+
+        <section class="card diagnostics-card">
+          <div class="card-head">
+            <h2>诊断</h2>
+            <div class="actions compact">
+              <button id="refresh-diag-btn" type="button" class="secondary">刷新诊断</button>
+              <button id="copy-diag-btn" type="button" class="secondary">复制诊断信息</button>
+            </div>
+          </div>
+
+          <h3>最近云端请求</h3>
+          <p class="hint">只记录方法、路径、状态码、错误类型和耗时；不记录请求头、请求体或令牌。</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>时间</th><th>方法</th><th>路径</th><th>状态</th><th>错误类型</th><th>耗时</th></tr>
+              </thead>
+              <tbody id="requests-body"></tbody>
+            </table>
+          </div>
+          <p id="requests-empty" class="empty">暂无云端请求记录。</p>
+
+          <h3>最近日志</h3>
+          <ul id="logs-list" class="logs"></ul>
+          <p id="logs-empty" class="empty">暂无日志。</p>
+
+          <details class="snapshot">
+            <summary>状态快照（不含令牌）</summary>
+            <pre id="snapshot">—</pre>
+          </details>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>本地后台，仅监听 127.0.0.1；关闭插件后地址失效。</span>
+        <span id="admin-port" class="footer-meta"></span>
+      </footer>
+    </div>
+
+    <textarea id="copy-fallback" class="copy-fallback" readonly hidden></textarea>
+    <script src="/app.js"></script>
+  </body>
+</html>
