@@ -1,0 +1,8 @@
+node_modules
+.npm-cache
+logs
+.vscode
+.env
+com.upkiry.bambumonitor.plugin/backend
+*.flexplugin
+.DS_Store
