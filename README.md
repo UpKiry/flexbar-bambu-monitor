@@ -9,15 +9,15 @@
 任务 · 层数 · 进度 · 剩余时间 · 喷嘴与热床 · 风扇 · AMS 槽位，一眼看全。
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-v0.7.0-cfe36b?labelColor=14181a&style=flat-square" />
-  <img alt="tests" src="https://img.shields.io/badge/tests-418%20passing-3fb950?labelColor=14181a&style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-v0.7.1-cfe36b?labelColor=14181a&style=flat-square" />
+  <img alt="tests" src="https://img.shields.io/badge/tests-419%20passing-3fb950?labelColor=14181a&style=flat-square" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="CI" src="https://github.com/UpKiry/flexbar-bambu-monitor/actions/workflows/release.yml/badge.svg" />
 </p>
 
-**[⬇ 下载最新安装包](https://github.com/UpKiry/flexbar-bambu-monitor/releases/latest)**  ·  **[📚 文档导航](docs/README.md)**  ·  **[🧾 v0.7.0 发行说明](docs/releases/v0.7.0.md)**  ·  **[🐛 反馈问题](https://github.com/UpKiry/flexbar-bambu-monitor/issues)**
+**[⬇ 下载最新安装包](https://github.com/UpKiry/flexbar-bambu-monitor/releases/latest)**  ·  **[📚 文档导航](docs/README.md)**  ·  **[🧾 v0.7.1 发行说明](docs/releases/v0.7.1.md)**  ·  **[🐛 反馈问题](https://github.com/UpKiry/flexbar-bambu-monitor/issues)**
 
 </div>
 
@@ -127,7 +127,7 @@ flowchart LR
 - **入口分层**：`src/plugin.js` 只做事件接线与生命周期，`src/runtime.js` 负责宿主事件、配置读写、UI 消息分发与绘制调度。
 - **依赖显式注入**：`auth/`、`cloud/`、`printer/`、`display/`、`util/` 按职责分层，通过 `createApi`、`createMqttClient`、`drawKeyFn` 传入依赖，可脱离宿主测试。
 - **发布目录**：`com.upkiry.bambumonitor.plugin/` 是 FlexDesigner 读取的插件目录（`manifest.json` + `ui/` + `resources/`），构建产物 `backend/` 不入库。
-- **测试**：27 个 `node:test` 文件、418 项断言，覆盖 mapper / reducer / presence / 调度预算 / Direct Draw / 后台安全边界。
+- **测试**：27 个 `node:test` 文件、419 项测试，覆盖 mapper / reducer / presence / 调度预算 / Direct Draw / 后台安全边界。
 
 ---
 
@@ -152,7 +152,7 @@ flowchart LR
 | 配置环境、找目录、写代码、构建测试 | [开发指南](docs/开发指南.md) |
 | 理解登录、模块关系、多设备与绘制生命周期 | [架构设计](docs/架构设计.md) |
 | 改 MQTT、字段映射、在线状态、时效、机型或 AMS | [设备协议与状态模型](docs/设备协议与状态模型.md) |
-| 看 0.7.0 改了什么 | [v0.7.0 发行说明](docs/releases/v0.7.0.md) |
+| 查看最新修复 | [v0.7.1 发行说明](docs/releases/v0.7.1.md) |
 | 确认测过什么、还缺什么 | [验证状态](docs/验证状态.md) |
 | 在 macOS 上做真机验收 | [macOS 真机验收指南](docs/macOS真机验收指南.md) |
 

@@ -182,6 +182,26 @@ test("Canvas 渲染全部栏目，调用 SDK 并透传结果", async () => {
   assert.deepEqual(canvas.calls.at(-1), ["restore"]);
 });
 
+test("宿主 Canvas 字宽限制下进度数字与百分号均显示，包括完成及旧读数", () => {
+  for (const percent of [0, 68, 100]) {
+    for (const stale of [false, true]) {
+      const data = input();
+      data.state.progressPercent = percent;
+      data.state.freshness.fields.progressPercent.stale = stale;
+      const canvas = fakeCanvas();
+      const ctx = canvas.getContext('2d');
+      // 宿主 @napi-rs/canvas 将 550 字重下的 100 测为约 889px。
+      ctx.measureText = value => ({ width: Array.from(String(value)).length *
+        (/^550 /.test(ctx.font) ? 296.45 : Number(ctx.font.match(/ (\d+)px/)[1]) * 0.55) });
+      renderDashboard(canvas, buildDashboardModel(data));
+      const digits = canvas.calls.find(c => c[0] === 'fillText' && c[2] === 512);
+      assert.equal(digits?.[1], String(percent));
+      assert.ok(canvas.calls.some(c => c[0] === 'fillText' && c[1] === '%'));
+      if (stale) assert.ok(canvas.calls.some(c => c[0] === 'fillText' && c[1] === '旧'));
+    }
+  }
+});
+
 test("缺少画布能力或错误图像时拒绝绘制", async () => {
   const plugin = { directDraw() { assert.fail("不应调用宿主"); } };
   await assert.rejects(drawDashboard({ plugin }), /createCanvas/);

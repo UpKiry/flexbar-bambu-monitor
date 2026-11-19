@@ -1,5 +1,5 @@
 {
-  "version": "0.7.0",
+  "version": "0.7.1",
   "scripts": {
     "admin:dev": "node scripts/admin-dev.js",
     "build": "rollup -c",

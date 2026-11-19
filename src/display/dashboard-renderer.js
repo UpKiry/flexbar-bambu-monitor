@@ -154,7 +154,8 @@ function renderDashboard(canvas, model, { width = WIDTH } = {}) {
     // 格式化百分比来自模型；进度线仅消费明确的有效数值，不解析展示字符串。
     const numericText = progress.text.endsWith("%") ? progress.text.slice(0, -1).trim() : progress.text;
     const progressWidth = text(numericText, 512, 27, 39,
-      progress.stale ? COLORS.stale : accent, progress.stale ? 96 : 111, 550);
+      // 宿主 Canvas 对非整百字重的字宽计算异常，会导致数字被整段裁掉。
+      progress.stale ? COLORS.stale : accent, progress.stale ? 96 : 111, 600);
     if (progress.text !== "—") text("%", 516 + progressWidth, 33, 17, COLORS.secondary, 20);
     if (progress.stale && progress.text !== "—") text("旧", 540 + progressWidth, 33, 10, COLORS.amber, 13);
     rect(514, 53, 139, 2, COLORS.divider);
