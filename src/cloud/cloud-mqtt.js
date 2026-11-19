@@ -1,5 +1,5 @@
 /**
- * 云 MQTT 连接（见 docs/云端监控设计方案.md §6.2）。
+ * 云 MQTT 连接（见 docs/设备协议与状态模型.md「MQTT 主题、报文白名单与事件」）。
  *
  * 社区资料描述的方案：用云账号令牌连接 MQTT，订阅 `device/{DEVICE_ID}/report`。
  * 需要在该区域的服务地址、用户标识、令牌权限、TLS 证书都验证过之后才真正可用。
@@ -103,6 +103,11 @@ function createCloudMqttClient({
   let reconnectTimer = null;
   let lastError = null;
   let reportHandler = null;
+  let presenceHandler = null;
+
+  function emitPresence(event) {
+    try { presenceHandler?.(event); } catch { logger?.warn?.("设备在线状态回调失败"); }
+  }
   let statusHandler = null;
   let subscribed = false;
   // A pending close gates both automatic reconnect and manager replacement.
@@ -220,6 +225,16 @@ function createCloudMqttClient({
       return;
     }
     captureFrame(topic, parsed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const receivedAt = now();
+    emitPresence({ type: "message", receivedAt });
+    if (Object.hasOwn(parsed, "event")) {
+      const event = parsed.event?.event;
+      if (event === "client.connected" || event === "client.disconnected") {
+        emitPresence({ type: "event", event, receivedAt });
+      }
+      return;
+    }
     const candidate = parsed?.print;
     const raw = candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
       (!candidate.command || candidate.command === "push_status" || candidate.command === "pushall") ? candidate : null;
@@ -227,7 +242,7 @@ function createCloudMqttClient({
     if (!raw && !amsIdentities.length) return;
     if (!reportHandler) return;
     try {
-      reportHandler({ ...(raw ? { raw } : {}), ...(amsIdentities.length ? { amsIdentities } : {}), receivedAt: now() });
+      reportHandler({ ...(raw ? { raw } : {}), ...(amsIdentities.length ? { amsIdentities } : {}), receivedAt });
     } catch {
       logger?.error?.("处理云端报文失败");
     }
@@ -325,6 +340,9 @@ function createCloudMqttClient({
     },
     onReport(handler) {
       reportHandler = handler;
+    },
+    onPresence(handler) {
+      presenceHandler = handler;
     },
     onStatus(handler) {
       statusHandler = handler;

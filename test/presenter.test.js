@@ -241,6 +241,60 @@ test("notifications are deduplicated per task and kind", () => {
   assert.equal(deduper.shouldNotify("finished", state), true);
 });
 
+function presenceInput(overrides = {}) {
+  return {
+    ...idleState, lastReportAt: 1_000,
+    presence: { state: "online", source: "telemetry", lastTelemetryAt: 600_000 },
+    freshness: { fields: { activity: { at: 1_000, stale: false }, "nozzle.current": { at: 1_000, stale: false } } },
+    ...overrides,
+  };
+}
+
+test("active presence keeps stable reported fields fresh beyond five minutes", () => {
+  const state = presenceInput();
+  assert.equal(displayFor(state, { now: 600_000 }).title, "打印机空闲");
+  assert.equal(displayFor(state, { now: 600_000 }).stale, false);
+  const { presence, ...withoutPresence } = state;
+  assert.equal(displayFor(withoutPresence, { presence, now: 600_000 }).stale, false);
+});
+
+test("presence and broker failures take priority over retained activity and faults", () => {
+  for (const [status, title] of [["offline", "打印机离线"], ["unknown", "打印机状态未知"], ["syncing", "等待打印机同步"], ["unresponsive", "设备无响应"]]) {
+    const state = presenceInput({ activity: "failed", printError: "42", presence: { state: status } });
+    const before = structuredClone(state);
+    assert.equal(displayFor(state, { now: 600_000 }).title, title);
+    const disconnected = displayFor(state, { now: 600_000, link: { state: "reconnecting" } });
+    assert.equal(disconnected.title, "云端连接中断");
+    assert.match(disconnected.subtitle, /打印机状态未知/);
+    assert.deepEqual(state, before);
+  }
+});
+
+test("online presence cannot revive disconnected, unreported or future field marks", () => {
+  for (const mark of [{ at: 1_000, stale: true }, undefined, { at: 600_001, stale: false }]) {
+    const state = presenceInput();
+    state.freshness.fields["nozzle.current"] = mark;
+    assert.equal(displayFor(state, { now: 600_000 }).title, "数据已过期");
+  }
+  const state = presenceInput();
+  delete state.freshness;
+  state.errorCode = "42";
+  state.printError = "42";
+  assert.equal(displayFor(state, { now: 600_000 }).title, "数据已过期");
+  assert.equal(displayFor(state, { now: 600_000 }).stale, true);
+});
+
+test("online getter is guarded against silent telemetry and clock rollback", () => {
+  for (const at of [null, -1, Number.NaN, 600_001]) {
+    const state = presenceInput({ presence: { state: "online", lastTelemetryAt: at } });
+    assert.equal(displayFor(state, { now: 600_000 }).title, "打印机状态未知");
+  }
+  const state = presenceInput({ presence: { state: "online", lastTelemetryAt: 480_000 } });
+  assert.equal(displayFor(state, { now: 600_000 }).title, "设备无响应");
+  state.presence.lastTelemetryAt = 0;
+  assert.equal(displayFor(state, { now: 1_001 }).title, "打印机空闲");
+});
+
 test("key titles combine title and subtitle within the host limit", () => {
   assert.equal(toKeyTitle({ title: "打印中", subtitle: "进度 42% · 剩余 2 小时" }), "打印中 · 进度 42% · 剩余 2 小时");
   assert.equal(toKeyTitle({ title: "打印机空闲", subtitle: "" }), "打印机空闲");

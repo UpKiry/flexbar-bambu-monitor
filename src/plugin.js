@@ -7,7 +7,7 @@ const { createPluginRuntime } = require("./runtime");
 const { createAdminServer } = require("./admin/server");
 
 /**
- * FlexDesigner 入口（见 docs/云端监控设计方案.md §7）。
+ * FlexDesigner 入口（见 docs/开发指南.md「项目边界与目录」）。
  *
  * 这里只做接线：事件注册、服务启动、生命周期收尾。协议细节都在各模块中，
  * 以便脱离宿主环境做单元测试。

@@ -2,7 +2,7 @@ const { CloudApiError, ERROR_KINDS, userMessageFor } = require("../cloud/cloud-a
 const { resolveRegion } = require("../cloud/region");
 
 /**
- * 登录状态机（见 docs/云端监控设计方案.md §5.1）。
+ * 登录状态机（见 docs/架构设计.md「登录状态机」）。
  *
  *   未登录 → 登录中 → 等待验证码 / 等待二次验证 → 已登录
  *                          ↘ 登录失败，可由用户重试

@@ -1,32 +1,65 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const vm = require("node:vm");
-const path = require("node:path");
+const { createApp } = require("../src/admin/client/main");
+const { getPrinterCapabilities } = require("../src/printer/capabilities");
 
-function page(fetch) {
+function makeDom() {
   const nodes = new Map();
   function node(id) {
     if (!nodes.has(id)) nodes.set(id, {
       id, value: "", textContent: "", hidden: id === "service-warning", disabled: false, readOnly: false,
-      dataset: {}, children: [], appendChild(child) { this.children.push(child); },
-      removeChild() { this.children.shift(); }, get firstChild() { return this.children[0]; },
+      dataset: {}, children: [], style: {},
+      appendChild(child) { this.children.push(child); },
+      removeChild() { this.children.shift(); },
+      get firstChild() { return this.children[0]; },
       focus() {}, addEventListener() {}, setAttribute(key, value) { this[key] = value; },
     });
     return nodes.get(id);
   }
-  const document = { getElementById: node, createElement: () => ({ value: "", textContent: "", dataset: {}, style: {}, children: [], setAttribute() {}, appendChild(child) { this.children.push(child); } }), addEventListener() {}, hidden: false };
-  const context = { document, fetch, URL, URLSearchParams, location: { hash: "", pathname: "/", search: "" }, history: {}, sessionStorage: {}, window: {}, navigator: {}, setInterval, clearInterval, setTimeout, Date, console };
-  const file = path.join(__dirname, "../com.upkiry.bambumonitor.plugin/resources/admin/app.js");
-  const source = fs.readFileSync(file, "utf8").replace("  init();\n})();", "  globalThis.page = { state, loadStatus, loadDiagnostics, handleActionResult, renderStatus, diagnosticExport, runAction, selectTab, renderDiagnostics, renderDebugFrames };\n})();");
-  vm.runInNewContext(source, context);
-  context.page.state.token = "token";
-  return { ...context.page, node, renderStatus(data) {
-    // 模拟 runtime 每次状态响应都会按当前机型和状态重算能力。
-    if (data.printer) data.printer.capabilities = require("../src/printer/capabilities").getPrinterCapabilities(
-      data.devices?.find(device => device.id === data.config?.printerId)?.model, data.printer.state);
-    context.page.renderStatus(data);
-  } };
+  const document = {
+    getElementById: node,
+    createElement: (tag) => ({
+      tag, value: "", textContent: "", dataset: {}, style: {}, children: [], open: false,
+      setAttribute(key, value) { this[key] = value; },
+      appendChild(child) { this.children.push(child); },
+    }),
+    addEventListener() {},
+    hidden: false,
+  };
+  return { document, node };
+}
+
+/** 用模块接口构造后台应用，替代过去对打包产物的源码替换。 */
+function page(fetchFn, { hash = "", stored = "" } = {}) {
+  const { document, node } = makeDom();
+  const storage = {
+    value: stored,
+    getItem() { return this.value; },
+    setItem(_key, value) { this.value = value; },
+    removeItem() { this.value = ""; },
+  };
+  const app = createApp({
+    document,
+    location: { hash, pathname: "/", search: "" },
+    history: { replaceState() {} },
+    storage,
+    fetchFn,
+  });
+  app.state.token = app.state.token || "token";
+  return {
+    ...app,
+    node,
+    renderStatus(data) {
+      // 模拟 runtime 每次状态响应都会按当前机型和状态重算能力。
+      if (data.printer) {
+        data.printer.capabilities = getPrinterCapabilities(
+          data.devices?.find((device) => device.id === data.config?.printerId)?.model,
+          data.printer.state,
+        );
+      }
+      app.renderStatus(data);
+    },
+  };
 }
 const ok = (data) => ({ status: 200, ok: true, json: async () => data });
 const status = (overrides = {}) => ({ auth: { state: "signed-out" }, config: { region: "china" }, devices: [], ...overrides });
@@ -365,6 +398,41 @@ test("A1 热端风扇从有效上报显示百分比，缺失和非法值不刷�
   data.printer.state = resetForPrinter("next");
   ui.renderStatus(data);
   assert.equal(ui.node("sensor-fan-heatbreak").hidden, true);
+});
+
+test("打印机离线与云端断开独立显示，活跃增量保留稳定字段和观测时间", () => {
+  const ui = page(async () => ok({}));
+  const at = Date.now();
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"},
+    devices: [{id: "x", model: "A1", online: null}], printer: {
+      link: {state: "connected"},
+      presence: {state: "online", lastMessageAt: at, lastTelemetryAt: at},
+      state: {activity: "printing", lastReportAt: at, fans: {heatbreak: 0},
+        freshness: {fields: {activity: {at: at - 600000, stale: false}, "fans.heatbreak": {at: at - 600000, stale: false}}}},
+    }});
+  ui.renderStatus(data);
+  assert.equal(ui.node("printer-presence").textContent, "打印机在线");
+  assert.equal(ui.node("fan-heatbreak").textContent, "0%");
+  assert.equal(ui.node("hero-state").textContent, "打印中");
+  assert.equal(data.printer.state.freshness.fields["fans.heatbreak"].at, at - 600000);
+  data.printer.presence.state = "offline";
+  ui.renderStatus(data);
+  assert.equal(ui.node("hero-state").textContent, "打印机离线");
+  assert.equal(ui.node("fan-heatbreak").textContent, "0%（旧数据）");
+  data.printer.link.state = "reconnecting";
+  ui.renderStatus(data);
+  assert.match(ui.node("printer-presence").textContent, /云端连接中断.*未知/);
+  data.printer.link.state = "connected";
+  data.printer.presence.state = "syncing";
+  ui.renderStatus(data);
+  assert.equal(ui.node("hero-state").textContent, "等待设备同步");
+  data.printer.presence.state = "unresponsive";
+  ui.renderStatus(data);
+  assert.equal(ui.node("hero-state").textContent, "设备无响应");
+  data.printer.presence.state = "online";
+  data.printer.state.freshness.fields["fans.heatbreak"].stale = true;
+  ui.renderStatus(data);
+  assert.equal(ui.node("fan-heatbreak").textContent, "0%（旧数据）");
 });
 
 test("调试Tab按协议与文本过滤，安全显示报文并保留展开状态", () => {

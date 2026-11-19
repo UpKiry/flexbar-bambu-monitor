@@ -248,8 +248,8 @@ function request({
 /**
  * Bambu 云 HTTP 适配器。
  *
- * 设计文档 §5.2 要求"应用层不直接依赖固定响应结构"，因此所有原始响应都在这里
- * 转换成明确的领域对象；上层只看到 accessToken / devices / uid。
+ * 云端适配层统一转换原始响应，输出明确的领域对象；
+ * 上层只看到 accessToken / devices / uid，不直接依赖原始响应结构。
  */
 class CloudApi {
   constructor({ region = "global", regionConfig, timeoutMs = DEFAULT_TIMEOUT_MS, requestFn, onRequest, onFrame } = {}) {
@@ -436,7 +436,7 @@ class CloudApi {
         id: device.dev_id,
         name: String(device.name || device.dev_product_name || device.dev_id),
         model: String(device.dev_product_name || device.dev_model_name || ""),
-        online: device.online === true,
+        online: typeof device.online === "boolean" ? device.online : null,
         printStatus: device.print_status == null ? null : String(device.print_status),
         nozzleDiameter: device.nozzle_diameter == null ? null : String(device.nozzle_diameter),
       }));

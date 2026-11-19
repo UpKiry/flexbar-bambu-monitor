@@ -1,5 +1,5 @@
 /**
- * 原始设备状态 → 统一领域模型（见 docs/云端监控设计方案.md §6.3）。
+ * 原始设备状态 → 统一领域模型（见 docs/设备协议与状态模型.md「领域值、增量与任务切换」）。
  *
  * 约定：
  * - `null` 表示未知或不可用，不转换成 0；
@@ -403,6 +403,17 @@ function isTaskSwitch(previous, raw) {
   return nextName !== null && previousName != null && nextName !== previousName;
 }
 
+/**
+ * 打印机领域状态的唯一初始形状与字段契约。
+ *
+ * 归属（见 docs/设备协议与状态模型.md）：
+ * - `freshness` 只能由 state-reducer 写入，消费方只读；缺少某个键表示该字段从未收到有效观测。
+ * - `connection` / `reportStale` 描述连接代次，不表示读数是否有效；断线不清零。
+ * - 设备 live 的 `presence` 不在此结构内，由 presence.js 维护并由调用方另行附加。
+ *
+ * 字段语义：缺失保留旧值；显式 `null` 按字段语义清空；有效 `0` 是正常读数。
+ * 该结构由 manager 发布为只读快照，调用方不得原地修改。
+ */
 function emptyPrinterState(printerId) {
   return {
     printerId: printerId || "",

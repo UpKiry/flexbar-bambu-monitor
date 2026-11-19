@@ -1,7 +1,7 @@
 const { TONES } = require("./presenter");
 
 /**
- * 把展示模型画到 Flexbar 按键上（见 docs/云端监控设计方案.md §3.2、§7）。
+ * 把展示模型画到 Flexbar 按键上（见 docs/架构设计.md「展示与绘制」）。
  *
  * 关键取舍：
  * - 只用宿主原生标题/图标布局，不自绘 PNG，避免引入 canvas 原生依赖；
@@ -63,8 +63,8 @@ async function drawKey(plugin, serialNumber, key, display, { titleText } = {}) {
 /**
  * 原生布局只有标题，没有副标题，因此把最重要的两项合成一行。
  *
- * 超过宿主标题上限的文本会被截断成 "…"，这是设计文档 §3.2 要求的
- * "显示时截断过长内容"。
+ * 超过宿主标题上限的文本会被截断成 "…"，遵循 docs/架构设计.md
+ * 「展示与绘制」中显示时截断过长内容的约定。
  */
 function toKeyTitle(display, { maxLength = 32 } = {}) {
   if (!display) return "";

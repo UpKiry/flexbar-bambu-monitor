@@ -5,17 +5,15 @@ const { createAuthService, STATES } = require("./auth/auth-service");
 const { createCredentialStore } = require("./auth/credential-store");
 const { createDiagnostics } = require("./admin/diagnostics");
 const { createPrinterManager } = require("./printer/printer-manager");
+const { createMonitorRegistry } = require("./printer/monitor-registry");
 const { getPrinterCapabilities } = require("./printer/capabilities");
-const { drawKey, toKeyTitle } = require("./display/key-renderer");
+const { drawKey } = require("./display/key-renderer");
 const { drawDashboard } = require("./display/dashboard");
+const { createDisplayController } = require("./display/display-controller");
 const {
   buildDisplay,
   buildViewDetails,
-  createDrawThrottle,
-  fingerprintDisplay,
   fieldIsFresh,
-  nextView,
-  VIEWS,
 } = require("./display/presenter");
 
 const KEY_CID = "com.upkiry.bambumonitor.monitor";
@@ -77,17 +75,23 @@ function createPluginRuntime({
     logger: safeLogger,
     now,
   });
-  const printer = createMqttManager({ logger: safeLogger, now, onFrame });
-  const throttles = new Map();
-  const additionalPrinters = new Map();
-  const closingManagers = new Map();
+  let handleDeviceEvent = () => {};
+  const monitors = createMonitorRegistry({
+    createManager: createMqttManager,
+    logger: safeLogger,
+    onFrame,
+    onEvent: (event) => handleDeviceEvent(event),
+  });
+  /** 默认设备管理器：runtime.printer 与后台状态的兼容入口。 */
+  const printer = monitors.defaultManager;
 
   let config = { ...DEFAULT_CONFIG };
-  /** 当前已启动的监控，用于避免重复建立云连接。 */
-  let activeMonitor = null;
+  /** 默认设备切换时的关闭屏障；期间暂停新连接。 */
   let reconfiguring = false;
-  let reconfiguration = 0;
+  /** 重配置修订号：丢弃过时的关闭回调。 */
+  let reconfigurationRevision = 0;
   let devices = [];
+  let devicesFetchedAt = null;
   let devicesError = null;
   // 只有当前会话成功读取的设备列表才能授权监控。
   let verifiedToken = null;
@@ -104,11 +108,6 @@ function createPluginRuntime({
     configQueue = result.catch(() => {});
     return result;
   }
-  /** (serialNumber, uid) → 按键；uid 只在所属 Flexbar 内唯一。 */
-  const keys = new Map();
-  const dashboards = new Map();
-  /** 每个按键的视图，按键点击时轮换。 */
-  const views = new Map();
 
   function logError(message) {
     // 异常可能包含设备文本、云响应或凭据，日志只记录固定上下文。
@@ -127,6 +126,7 @@ function createPluginRuntime({
   function clearDeviceVerification() {
     verifiedToken = null;
     devices = [];
+    devicesFetchedAt = null;
     devicesError = null;
   }
 
@@ -139,23 +139,33 @@ function createPluginRuntime({
     return "";
   }
 
+  function displayState(manager) {
+    const source = manager?.state;
+    return source && manager.presence ? { ...source, presence: manager.presence } : source;
+  }
+
+  function tickPrinters() {
+    monitors.tick();
+  }
+
   function buildDisplayFor(view, printerId = config.printerId) {
-    const printer = printerFor(printerId);
+    const manager = printerFor(printerId);
     const blocked = monitorBlockMessage(printerId);
     if (blocked) return { tone: "warning", title: "无法连接设备", subtitle: blocked, icon: "cloud-off", stale: true };
     const base = buildDisplay({
       signedIn: auth.state === STATES.signedIn,
       authExpired: auth.state === STATES.expired,
       hasPrinter: Boolean(printerId),
-      state: printer?.state,
-      link: { state: printerMap(printer?.status?.state), lastError: printer?.status?.lastError },
+      state: displayState(manager),
+      presence: manager?.presence,
+      link: { state: printerMap(manager?.status?.state), lastError: manager?.status?.lastError },
       now: now(),
     });
     // 只有确实收到过设备报文时，温度 / 任务视图才有意义；
     // 登录提示等前置状态仍然显示原因，而不是一片 "无数据"。
-    const hasReport = printer?.state?.lastReportAt !== null && printer?.state?.lastReportAt !== undefined;
-    if (view && view !== "progress" && hasReport && printer?.status?.state === "connected" && !base.stale && base.tone !== "critical") {
-      const source = printer.state;
+    const hasReport = manager?.state?.lastReportAt !== null && manager?.state?.lastReportAt !== undefined;
+    if (view && view !== "progress" && hasReport && manager?.status?.state === "connected" && !base.stale && base.tone !== "critical") {
+      const source = displayState(manager);
       const at = now();
       const fields = view === "temperature"
         ? [["nozzle.current", source.nozzle?.current], ["nozzle.target", source.nozzle?.target], ["bed.current", source.bed?.current], ["bed.target", source.bed?.target]]
@@ -177,61 +187,40 @@ function createPluginRuntime({
     return "idle";
   }
 
-  function keyIdentity(serialNumber, uid) {
-    return JSON.stringify([serialNumber, uid]);
-  }
+  /**
+   * 绘制会话由独立控制器维护；runtime 只提供展示所需的事实。
+   * 依赖均为函数声明，可在此处安全引用。
+   */
+  const display = createDisplayController({
+    plugin,
+    now,
+    createCanvas,
+    drawKeyFn,
+    drawDashboardFn,
+    resolvePrinterId: (key) => keyPrinterId(key),
+    buildKeyDisplay: (view, printerId) => buildDisplayFor(view, printerId),
+    buildDashboardInput: (printerId) => {
+      const manager = printerFor(printerId);
+      return {
+        state: auth.state === STATES.signedIn ? displayState(manager) : null,
+        link: manager?.status,
+        signedIn: auth.state === STATES.signedIn,
+        authExpired: auth.state === STATES.expired,
+        printerName: devices.find((device) => device.id === printerId)?.name
+          || (printerId === config.printerId ? config.printerName : ""),
+        model: devices.find((device) => device.id === printerId)?.model,
+      };
+    },
+    inspectPrinter: (printerId) => ({ blocked: monitorBlockMessage(printerId) }),
+    requestFullState: (printerId) => printerFor(printerId)?.requestFullState(),
+    onKeyDevicesChanged: () => syncAdditional(),
+    logError,
+    logWarn: (message) => safeLogger.warn(message),
+    logInfo: (message) => safeLogger.info(message),
+  });
 
-  function viewFor(identity) {
-    const view = views.get(identity);
-    return VIEWS.includes(view) ? view : "progress";
-  }
-
-  async function renderAll({ urgent = false } = {}) {
-    for (const entry of keys.values()) {
-      // Direct Draw 入口由宿主管理，普通 draw 会覆盖其触摸区域。
-      if (entry.key.cfg?.keyType === "directDraw") continue;
-      if (createCanvas && dashboards.has(entry.serialNumber)) continue;
-      const identity = keyIdentity(entry.serialNumber, entry.key.uid);
-      const view = viewFor(identity);
-      const display = buildDisplayFor(view, keyPrinterId(entry.key));
-      let throttle = throttles.get(identity);
-      if (!throttle) { throttle = createDrawThrottle({ now }); throttles.set(identity, throttle); }
-      const fingerprint = fingerprintDisplay(display, view);
-      if (!throttle.shouldDraw(fingerprint, { urgent })) continue;
-      try {
-        await drawKeyFn(plugin, entry.serialNumber, entry.key, display, {
-          titleText: toKeyTitle(display, { view }),
-        });
-      } catch (error) {
-        logError("绘制按键失败", error);
-      }
-    }
-    for (const [serialNumber, session] of dashboards) {
-      if (shuttingDown || session.busy || !createCanvas) continue;
-      const printerId = keyPrinterId(session.key);
-      const selected = printerFor(printerId);
-      const blocked = monitorBlockMessage(printerId);
-      session.busy = true;
-      Promise.resolve().then(() => {
-        if (shuttingDown || dashboards.get(serialNumber) !== session) return;
-        return drawDashboardFn({
-          plugin, serialNumber, key: session.key, createCanvas, now: now(),
-          state: blocked || auth.state !== STATES.signedIn ? null : selected?.state,
-          link: blocked ? { state: "failed", lastError: { message: blocked } } : selected?.status,
-          signedIn: auth.state === STATES.signedIn, authExpired: auth.state === STATES.expired,
-          hasPrinter: Boolean(printerId),
-          printerName: devices.find((device) => device.id === printerId)?.name || (printerId === config.printerId ? config.printerName : ""),
-        });
-      }).catch((error) => {
-        const message = typeof error?.message === "string" ? error.message : "";
-        const hostReason = message.startsWith("Request failed:") ? message.split(", Command:")[0].slice(15) : "";
-        const tags = [[/direct.?draw/i, "directDraw"], [/key/i, "key"], [/page/i, "page"], [/type/i, "type"], [/device/i, "device"], [/image|png|base64/i, "image"], [/invalid/i, "invalid"], [/not found/i, "not-found"], [/not active|inactive/i, "inactive"], [/unsupported|unknown/i, "unsupported"], [/width|size/i, "size"]].filter(([pattern]) => pattern.test(hostReason)).map(([, tag]) => tag);
-        const reason = message.startsWith("Request timed out") ? "宿主请求超时"
-          : message.startsWith("Request failed:") ? `宿主拒绝请求${tags.length ? `（${tags.join("、")}）` : ""}`
-            : error instanceof TypeError ? "画布或参数类型错误" : "画布或宿主调用异常";
-        logError(`绘制详情页失败：${reason}`);
-      }).finally(() => { session.busy = false; });
-    }
+  function renderAll(options) {
+    return display.renderAll(options);
   }
 
   // ---------------------------------------------------------------------
@@ -243,78 +232,38 @@ function createPluginRuntime({
   }
 
   function printerFor(id) {
-    return id === config.printerId ? printer : additionalPrinters.get(id)?.manager;
+    return monitors.get(id);
   }
 
-  // A manager must not reconnect until its previous disconnect has settled.
-  // Retain a rejected close so an unconfirmed transport cannot be replaced.
-  function closeManager(manager) {
-    if (closingManagers.has(manager)) return closingManagers.get(manager);
-    let result;
-    try { result = manager.disconnect(); } catch { result = Promise.reject(new Error("无法确认旧连接已关闭")); }
-    const pending = Promise.resolve(result);
-    closingManagers.set(manager, pending);
-    pending.then(() => {
-      if (closingManagers.get(manager) === pending) closingManagers.delete(manager);
-    }, () => {});
-    return pending;
+  /** 关闭所有云连接；退出与换账号时使用。关闭失败由调用方决定是否提示。 */
+  function stopAllMonitors() {
+    return monitors.closeAll().catch(() => {});
   }
 
-  function waitForCloses() {
-    return Promise.all([...closingManagers.values()]);
-  }
-
-  function stopAdditional() {
-    const pending = [];
-    for (const entry of additionalPrinters.values()) {
-      entry.token = null;
-      pending.push(closeManager(entry.manager));
-    }
-    return Promise.all(pending);
-  }
-
-  function syncAdditional() {
-    if (reconfiguring || shuttingDown) return;
+  /**
+   * 按当前会话与需求收敛连接。需求 = 默认设备 + 按键显式选择；
+   * 未通过当前账号设备列表验证的设备不会连接。
+   */
+  function syncMonitors({ blocked = false } = {}) {
+    if (shuttingDown) return { deferred: false, started: [], stopped: [] };
     const token = auth.getAccessToken();
-    const wanted = new Set([...keys.values()].map(({ key }) => keyPrinterId(key)).filter((id) => id && id !== config.printerId));
-    for (const [id, entry] of additionalPrinters) {
-      if ((!wanted.has(id) || verifiedToken !== token || !devices.some((d) => d.id === id)) && entry.token) {
-        entry.token = null;
-        closeManager(entry.manager).catch(() => logError("断开云端连接失败"));
-      }
-    }
-    if (!token || verifiedToken !== token || !auth.getUserId()) return;
-    const region = resolveRegion(auth.getRegion() || config.region);
-    for (const id of wanted) {
-      const device = devices.find((item) => item.id === id);
-      if (!device) continue;
-      let entry = additionalPrinters.get(id);
-      if (!entry) {
-        const manager = createMqttManager({ logger: safeLogger, now, onFrame });
-        entry = { manager, token: null };
-        additionalPrinters.set(id, entry);
-        manager.subscribe((change) => {
-          if (change.type === "connection" && change.status?.state === "failed" && change.status?.lastError?.kind === "unauthorized" && entry.token === auth.getAccessToken()) {
-            sessionGeneration += 1;
-            activeMonitor = null;
-            clearDeviceVerification();
-            Promise.resolve(closeManager(printer)).catch(() => {});
-            stopAdditional().catch(() => {});
-            auth.invalidate("登录已失效，请重新登录").catch(() => logError("清理本地凭据失败")).finally(() => renderAll({ urgent: true }).catch(() => {}));
-          }
-          if (["state", "connection", "report"].includes(change.type)) renderAll({ urgent: change.type !== "report" || Boolean(change.taskSwitched) }).catch(() => {});
-        });
-        manager.selectPrinter(id, { name: device.name });
-      }
-      if (entry.token === token) continue;
-      const closing = closingManagers.get(entry.manager);
-      if (closing) {
-        closing.then(() => syncAdditional(), () => {}).catch(() => {});
-        continue;
-      }
-      entry.token = token;
-      if (!entry.manager.connect({ host: region.mqttHost, port: region.mqttPort, userId: auth.getUserId(), accessToken: token }).started) entry.token = null;
-    }
+    const verified = Boolean(verifiedToken && token && verifiedToken === token);
+    return monitors.reconcile({
+      token,
+      userId: auth.getUserId(),
+      region: auth.getRegion() || config.region,
+      verified,
+      devices: verified ? devices.map((device) => device.id) : [],
+      defaultId: config.printerId || null,
+      defaultName: config.printerName || null,
+      wantedIds: display.selectedPrinterIds(),
+      blocked: blocked || reconfiguring,
+    });
+  }
+
+  /** 兼容旧调用点：按键设备集合变化或登录态变化后同步连接。 */
+  function syncAdditional() {
+    syncMonitors();
   }
 
   function applyConfig(next) {
@@ -328,38 +277,29 @@ function createPluginRuntime({
     }
     if (config.region !== previous.region && auth.state === STATES.signedIn) {
       // 区域变更后旧令牌属于另一个服务端，必须停止监控并要求重新登录。
-      activeMonitor = null;
-      closeManager(printer).catch(() => logError("断开云端连接失败"));
-      stopAdditional().catch(() => {});
+      const closing = monitors.closeAll().catch(() => logError("断开云端连接失败"));
       auth.invalidate("账号区域已更改，请重新登录").catch(() => {});
       renderAll({ urgent: true }).catch(() => {});
+      closing.finally(() => { if (!shuttingDown) syncMonitors(); }).catch(() => {});
+      return;
     }
-    if (printerChanged) {
-      activeMonitor = null;
-      const needsHandoff = reconfiguring || [...additionalPrinters.values()].some((entry) => entry.token) ||
-        [...keys.values()].some(({ key }) => keyPrinterId(key) === previous.printerId && previous.printerId);
-      const revision = ++reconfiguration;
-      if (needsHandoff) {
-        reconfiguring = true;
-        const closed = Promise.all([closeManager(printer), stopAdditional()]);
-        printer.selectPrinter(config.printerId || null, { name: config.printerName });
-        closed.then(() => {
-          if (revision !== reconfiguration || shuttingDown) return;
-          reconfiguring = false;
-          startMonitoring();
-          syncAdditional();
-          renderAll({ urgent: true }).catch(() => {});
-        }, () => {
-          logError("断开云端连接失败");
-        });
-      } else {
-        reconfiguring = false;
-        printer.selectPrinter(config.printerId || null, { name: config.printerName });
-        if (config.printerId) startMonitoring();
-        else closeManager(printer);
-      }
+    if (!printerChanged) {
+      syncMonitors();
+      return;
     }
-    syncAdditional();
+    // 默认设备切换：先确认旧连接关闭，再按新需求建立，期间暂停新连接。
+    reconfiguring = true;
+    const revision = (reconfigurationRevision += 1);
+    const closed = monitors.closeAll();
+    closed.then(() => {
+      if (revision !== reconfigurationRevision || shuttingDown) return;
+      reconfiguring = false;
+      syncMonitors();
+      renderAll({ urgent: true }).catch(() => {});
+    }, () => {
+      // 关闭失败时保持屏障，不替换无法确认关闭的连接。
+      logError("断开云端连接失败");
+    });
   }
 
   /**
@@ -393,11 +333,7 @@ function createPluginRuntime({
     const epoch = sessionGeneration;
     const requestGeneration = ++deviceRequestGeneration;
     clearDeviceVerification();
-    stopAdditional().catch(() => logError("断开云端连接失败"));
-    if (activeMonitor) {
-      activeMonitor = null;
-      Promise.resolve(closeManager(printer)).catch(() => logError("断开云端连接失败"));
-    }
+    const closing = monitors.closeAll().catch(() => logError("断开云端连接失败"));
     renderAll({ urgent: true }).catch(() => {});
     const current = () => !shuttingDown && epoch === sessionGeneration && requestGeneration === deviceRequestGeneration && auth.state === STATES.signedIn && auth.getAccessToken() === token;
     if (!token) {
@@ -409,7 +345,8 @@ function createPluginRuntime({
       const list = await api.fetchDevices(token);
       if (!current()) return { status: "cancelled" };
       try {
-        await waitForCloses();
+        await closing;
+        await monitors.waitForCloses();
       } catch {
         if (!current()) return { status: "cancelled" };
         devicesError = "无法确认旧云连接已关闭";
@@ -418,10 +355,10 @@ function createPluginRuntime({
       }
       if (!current()) return { status: "cancelled" };
       devices = list;
+      devicesFetchedAt = now();
       verifiedToken = token;
       devicesError = null;
-      startMonitoring();
-      syncAdditional();
+      syncMonitors();
       renderAll({ urgent: true }).catch(() => {});
       return { status: "success", devices };
     } catch (error) {
@@ -432,10 +369,9 @@ function createPluginRuntime({
       // 令牌失效必须转移到"需要重新登录"，否则界面会一直停留在登录态。
       if (error?.kind === ERROR_KINDS.unauthorized) {
         sessionGeneration += 1;
-        activeMonitor = null;
         clearDeviceVerification();
         devicesError = "登录已失效，请重新登录";
-        Promise.resolve(closeManager(printer)).catch(() => logError("断开云端连接失败"));
+        monitors.closeAll().catch(() => logError("断开云端连接失败"));
         await auth.invalidate("登录已失效，请重新登录");
         renderAll({ urgent: true }).catch(() => {});
       }
@@ -468,7 +404,7 @@ function createPluginRuntime({
         }
       }
     });
-    if (current()) startMonitoring();
+    if (current()) syncMonitors();
   }
 
   // ---------------------------------------------------------------------
@@ -476,52 +412,32 @@ function createPluginRuntime({
   // ---------------------------------------------------------------------
 
   /**
-   * 幂等：登录流程和配置变更都可能调用它，重复调用不能建出两条连接。
+   * 唯一的会话失效入口：先撤销设备归属并停止全部监控，再清理凭据。
+   * 只接受仍属于当前会话的事件，旧连接的迟到失败不能登出新会话。
    */
-  function startMonitoring() {
-    if (reconfiguring || shuttingDown) return { started: false, reason: "reconfiguring" };
-    const closing = closingManagers.get(printer);
-    if (closing) {
-      closing.then(() => startMonitoring(), () => {}).catch(() => {});
-      return { started: false, reason: "closing" };
-    }
-    const token = auth.getAccessToken();
-    const userId = auth.getUserId();
-    if (!token) return { started: false, reason: "no-token" };
-    if (!userId) return { started: false, reason: "no-user-id" };
-    if (!config.printerId) return { started: false, reason: "no-printer" };
-    if (verifiedToken !== token || !devices.some((device) => device.id === config.printerId)) {
-      return { started: false, reason: "device-unverified" };
-    }
-    if (activeMonitor && activeMonitor.printerId === config.printerId && activeMonitor.token === token) {
-      return { started: false, reason: "already-running" };
-    }
-    const region = resolveRegion(auth.getRegion() || config.region);
-    const result = printer.connect({
-      host: region.mqttHost,
-      port: region.mqttPort,
-      userId,
-      accessToken: token,
-    });
-    activeMonitor = result.started ? { printerId: config.printerId, token } : null;
-    return result;
+  function expireSession(message = "登录已失效，请重新登录") {
+    sessionGeneration += 1;
+    clearDeviceVerification();
+    const closing = monitors.closeAll().catch(() => logError("断开云端连接失败"));
+    return auth.invalidate(message)
+      .catch(() => logError("清理本地凭据失败"))
+      .finally(() => Promise.resolve(closing).finally(() => renderAll({ urgent: true }).catch(() => {})));
   }
 
   /** 上一次绘制的业务状态，用于判断"这次是不是状态切换"。 */
   let lastActivity = null;
 
-  printer.subscribe((change) => {
+  handleDeviceEvent = ({ change, token }) => {
+    if (shuttingDown) return;
+    const currentToken = auth.getAccessToken();
+    const belongsToSession = Boolean(token && currentToken && token === currentToken);
     if (change.type === "connection" && change.status?.state === "failed" &&
-        change.status?.lastError?.kind === "unauthorized" && activeMonitor &&
-        activeMonitor.printerId === config.printerId && activeMonitor.token === auth.getAccessToken()) {
-      sessionGeneration += 1;
-      activeMonitor = null;
-      clearDeviceVerification();
-      stopAdditional().catch(() => {});
-      Promise.resolve(closeManager(printer)).catch(() => logError("断开云端连接失败"));
-      auth.invalidate("登录已失效，请重新登录")
-        .catch(() => logError("清理本地凭据失败"))
-        .finally(() => renderAll({ urgent: true }).catch(() => {}));
+        change.status?.lastError?.kind === "unauthorized" && belongsToSession) {
+      expireSession();
+    }
+    if (change.type === "presence") {
+      renderAll({ urgent: true }).catch((error) => logError("刷新连接状态失败", error));
+      return;
     }
     if (change.type === "state" || change.type === "connection") {
       const urgent = change.type === "connection" || change.state?.activity !== lastActivity;
@@ -530,13 +446,13 @@ function createPluginRuntime({
       return;
     }
     if (change.type === "report") {
-      // 设计文档 §6.4：状态切换、断线和故障可以立即更新，普通进度按节流刷新。
+      // docs/架构设计.md「展示与绘制」：状态切换、断线和故障可以立即更新，普通进度按节流刷新。
       const activityChanged = change.state?.activity !== lastActivity;
       lastActivity = change.state?.activity ?? lastActivity;
       const urgent = activityChanged || Boolean(change.taskSwitched);
       renderAll({ urgent }).catch((error) => logError("刷新按键失败", error));
     }
-  });
+  };
 
   // 被节流掉的进度更新需要有人补画，否则打印中会停在旧百分比。
   let drawTimer = null;
@@ -544,6 +460,7 @@ function createPluginRuntime({
   function ensureDrawTimer() {
     if (drawTimer) return;
     drawTimer = setInterval(() => {
+      tickPrinters();
       renderAll({ urgent: false }).catch((error) => logError("定时刷新按键失败", error));
     }, DRAW_TICK_MS);
     if (typeof drawTimer.unref === "function") drawTimer.unref();
@@ -554,75 +471,20 @@ function createPluginRuntime({
   // ---------------------------------------------------------------------
 
   plugin.on("plugin.alive", (payload) => {
-    for (const key of payload.keys || []) {
-      if (key.cid !== KEY_CID) continue;
-      const identity = keyIdentity(payload.serialNumber, key.uid);
-      keys.set(identity, { key, serialNumber: payload.serialNumber });
-      if (key.cfg?.keyType === "directDraw") dashboards.set(payload.serialNumber, { key, busy: false });
-      // 每个按键独立保存视图；按键配置里选的视图优先于内存状态。
-      if (VIEWS.includes(key.data?.view)) views.set(identity, key.data.view);
-    }
-    syncAdditional();
-    renderAll({ urgent: true }).catch((error) => logError("初始绘制失败", error));
+    display.handleAlive({ ...payload, keys: (payload.keys || []).filter((key) => key.cid === KEY_CID) });
   });
 
   // Direct Draw 页面不走普通按键的 plugin.data 点击事件；SDK 将屏幕触摸单独报告为 device.touch。
-  plugin.on("device.touch", (payload) => {
-    if (payload?.state !== "down") return;
-    const session = dashboards.get(payload.serialNumber);
-    if (!session) return;
-    const printerId = keyPrinterId(session.key);
-    const blocked = monitorBlockMessage(printerId);
-    if (blocked) {
-      safeLogger.warn(`触摸屏幕未请求完整状态：${blocked}`);
-      return;
-    }
-    const result = printerFor(printerId)?.requestFullState();
-    const level = result?.sent ? "success" : result?.reason === "cooldown" || result?.reason === "not-connected" ? "warning" : "error";
-    const message = result?.sent ? "已请求完整状态，等待设备上报"
-      : result?.reason === "cooldown" ? `请稍候 ${Math.max(1, Math.ceil((result.retryInMs || 0) / 1000))} 秒再请求`
-        : result?.reason === "not-connected" ? "云端未连接，无法请求状态" : "状态请求未发送";
-    if (!result?.sent) safeLogger.info(`触摸屏幕请求完整状态未提交：${message}`);
-    Promise.resolve(plugin.showFlexbarSnackbarMessage?.(payload.serialNumber, message, level, "refresh", 1800))
-      .catch(() => safeLogger.warn("显示屏幕触摸反馈失败"));
-  });
+  plugin.on("device.touch", (payload) => display.handleTouch(payload));
 
   plugin.on("plugin.data", (payload) => {
-    const key = payload?.data?.key;
-    if (!key || key.cid !== KEY_CID) return;
-    // Direct Draw 触摸只由 device.touch 报告；不把它当作普通按键点击。
-    if (key.cfg?.keyType === "directDraw") {
-      dashboards.set(payload.serialNumber, { key, busy: false });
-      return;
-    }
-    const identity = keyIdentity(payload.serialNumber, key.uid);
-    const current = viewFor(identity);
-    const next = nextView(current);
-    views.set(identity, next);
-    const entry = keys.get(identity);
-    if (entry) entry.key = key;
-    syncAdditional();
-    renderAll({ urgent: true }).catch((error) => logError("切换视图失败", error));
+    if (!payload?.data?.key || payload.data.key.cid !== KEY_CID) return;
+    display.handleData(payload);
   });
 
-  plugin.on("plugin.dead", (payload) => {
-    const session = dashboards.get(payload?.serialNumber);
-    if (session && (payload.keys || []).some((key) => key.uid === session.key.uid)) dashboards.delete(payload.serialNumber);
-    // 页面退出未必删除父页面的入口按键，保留按键及其监控。
+  plugin.on("plugin.dead", (payload) => display.handleDead(payload));
 
-  });
-
-  plugin.on("device.status", (list) => {
-    const serials = new Set((list || []).filter((item) => item.status !== "disconnected").map((item) => item.serialNumber));
-    for (const serial of dashboards.keys()) if (!serials.has(serial)) dashboards.delete(serial);
-    for (const [uid, entry] of keys) {
-      if (serials.has(entry.serialNumber)) continue;
-      keys.delete(uid);
-      views.delete(uid);
-      throttles.delete(uid);
-    }
-    syncAdditional();
-  });
+  plugin.on("device.status", (list) => display.handleDeviceStatus(list));
 
   plugin.on("plugin.config.updated", () => {
     queueConfig(() => loadConfig()).catch((error) => logError("应用插件配置失败", error));
@@ -639,11 +501,7 @@ function createPluginRuntime({
     if (previousState !== STATES.signingIn && auth.state === STATES.signingIn) {
       sessionGeneration += 1;
       clearDeviceVerification();
-      stopAdditional().catch(() => logError("断开云端连接失败"));
-      if (activeMonitor) {
-        activeMonitor = null;
-        Promise.resolve(closeManager(printer)).catch(() => logError("断开云端连接失败"));
-      }
+      monitors.closeAll().catch(() => logError("断开云端连接失败"));
     }
     return { result, epoch: sessionGeneration };
   }
@@ -660,16 +518,15 @@ function createPluginRuntime({
         credentialStore: await credentialStore.status(),
         devices,
         devicesError,
+        devicesFetchedAt,
         monitorBlockMessage: monitorBlockMessage(),
         printer: {
-          id: config.printerId, name: printer.printerName, state: printer.state, link: printer.status,
+          id: config.printerId, name: printer.printerName, state: displayState(printer), link: printer.status,
+          presence: printer.presence,
           capabilities: getPrinterCapabilities(devices.find((device) => device.id === config.printerId)?.model, printer.state),
         },
         display: buildDisplayFor("progress"),
-        views: Array.from(views.entries()).map(([identity, view]) => {
-          const [serialNumber, uid] = JSON.parse(identity);
-          return { uid, view, serialNumber };
-        }),
+        views: display.listViews(),
         admin: adminController ? adminController.info() : { available: false },
       };
     },
@@ -705,13 +562,7 @@ function createPluginRuntime({
     },
     async logout() {
       const epoch = ++sessionGeneration;
-      activeMonitor = null;
-      let disconnecting;
-      try {
-        disconnecting = Promise.all([Promise.resolve(closeManager(printer)), stopAdditional()]);
-      } catch {
-        disconnecting = Promise.reject(new Error("无法确认云端连接已关闭"));
-      }
+      const disconnecting = monitors.closeAll();
       // 退出立即清除旧界面数据，异步撤销完成后不得覆盖新会话。
       clearDeviceVerification();
       const [cleanup, disconnected] = await Promise.allSettled([
@@ -857,11 +708,10 @@ function createPluginRuntime({
   /** 退出时先关闭浏览器后台，再断开云连接，避免留下监听端口。 */
   async function shutdown() {
     shuttingDown = true;
-    dashboards.clear();
+    display.dispose();
     sessionGeneration += 1;
-    activeMonitor = null;
     if (drawTimer) { clearInterval(drawTimer); drawTimer = null; }
-    const disconnecting = Promise.all([closeManager(printer), stopAdditional()]);
+    const disconnecting = monitors.closeAll();
     try {
       await adminController?.stop?.();
     } catch (error) {

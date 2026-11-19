@@ -1,4 +1,6 @@
-const { FONT_FAMILY } = require("./fonts");
+const { buildDashboardUi } = require("./dashboard-model");
+const { renderDashboard } = require("./dashboard-renderer");
+const { fieldIsFresh, markIsFresh: observationIsFresh, presenceDisplay } = require("./presenter");
 
 // 与 presenter 使用相同的上报过期阈值。
 const REPORT_STALE_MS = 5 * 60_000;
@@ -19,13 +21,10 @@ function validTime(time, now) {
 }
 
 function isFresh(state, field, link, now) {
-  if (link?.state !== "connected" || state?.reportStale === true) return false;
-  const fields = state?.freshness?.fields;
-  if (fields) {
-    const mark = fields[field];
-    return mark?.stale === false && validTime(mark.at, now);
-  }
-  return validTime(state?.lastReportAt, now);
+  if (link?.state !== "connected") return false;
+  // 带 presence 时由共享策略判断；无 presence 的兼容分支保留旧展示语义。
+  if (state?.presence || !state?.freshness?.fields) return fieldIsFresh(state, field, now);
+  return markIsFresh(state.freshness.fields[field], state, link, now);
 }
 
 function valueText(value, valid, format, state, field, link, now) {
@@ -38,8 +37,11 @@ const nonnegative = (value) => number(value) && value >= 0;
 const text = (value) => typeof value === "string" && value.trim().length > 0;
 
 function markIsFresh(mark, state, link, now) {
-  return link?.state === "connected" && state?.reportStale !== true &&
-    mark?.stale === false && validTime(mark.at, now);
+  if (link?.state !== "connected") return false;
+  if (state?.presence) return observationIsFresh(mark, state, now);
+  // 无 presence 的兼容路径：有标记时以标记为准，标记的 at 只描述观测时间。
+  // 这里不额外按年龄判旧，保持旧版 Dashboard 的展示语义。
+  return state?.reportStale !== true && mark?.stale === false && validTime(mark.at, now);
 }
 
 function amsSummary(state, link, now) {
@@ -74,8 +76,11 @@ function faultSummary(state, shown) {
 }
 
 /** 构造可独立测试的展示数据；更新时间使用宿主本地时区。 */
-function buildDashboardModel({ state, link, signedIn = true, authExpired = false, hasPrinter = true, printerName, now = Date.now() } = {}) {
-  let connection = CONNECTION[link?.state] || "云端状态未知";
+function buildDashboardModel({ state, link, presence = state?.presence, signedIn = true, authExpired = false, hasPrinter = true, printerName, model, feedback, now = Date.now() } = {}) {
+  if (presence && state?.presence !== presence) state = { ...state, presence };
+  const status = presenceDisplay(presence, link, now);
+  let connection = status ? (link?.state !== "connected" ? "云端连接中断，打印机状态未知" : status.title)
+    : presence ? "打印机在线" : CONNECTION[link?.state] || "云端状态未知";
   if (!signedIn) connection = authExpired ? "登录已失效" : "请登录";
   else if (!hasPrinter) connection = "请选择打印机";
   const effectiveLink = signedIn && hasPrinter ? link : null;
@@ -102,42 +107,12 @@ function buildDashboardModel({ state, link, signedIn = true, authExpired = false
     faults: faultSummary(state, shown),
     ams: amsSummary(state, effectiveLink, now),
     updated,
+    ui: buildDashboardUi({ state: state || {}, link: effectiveLink, model, signedIn, authExpired, hasPrinter, printerName, feedback, now }, {
+      fresh: key => isFresh(state, key, effectiveLink, now),
+      markFresh: mark => markIsFresh(mark, state, effectiveLink, now),
+      activityLabel, activityKey,
+    }),
   };
-}
-
-/** 使用标准 Canvas 2D 接口绘制；画布为调用方提供。 */
-function renderDashboard(canvas, model, { width = WIDTH } = {}) {
-  if (!Number.isFinite(width) || width <= 0) throw new TypeError("width 必须为正数");
-  const ctx = canvas?.getContext?.("2d");
-  if (!ctx) throw new TypeError("需要 Canvas 2D context");
-  ctx.save();
-  try {
-    ctx.scale(width / WIDTH, 1);
-    ctx.fillStyle = "#101820";
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
-    ctx.textBaseline = "middle";
-    const cell = (x, title, value, maxWidth) => {
-      ctx.font = `16px "${FONT_FAMILY}", sans-serif`;
-      ctx.fillStyle = "#a9b7c5";
-      ctx.fillText(title, x, 15, maxWidth);
-      ctx.font = `22px "${FONT_FAMILY}", sans-serif`;
-      ctx.fillStyle = "#f0f5f7";
-      ctx.fillText(String(value), x, 42, maxWidth);
-    };
-    cell(14, model.printerName, model.connection, 190);
-    cell(214, "打印状态", model.activity, 160);
-    cell(384, "进度", model.progress, 105);
-    cell(499, "剩余时间", model.remaining, 150);
-    cell(659, "喷嘴 当前 / 目标", model.nozzle, 190);
-    cell(859, "热床 当前 / 目标", model.bed, 190);
-    cell(1059, "任务", model.task, 180);
-    cell(1249, "层数", model.layers, 120);
-    cell(1379, "故障原始码 / HMS", model.faults, 245);
-    cell(1634, "AMS 槽位", model.ams, 245);
-    cell(1889, "最近设备上报", model.updated, 267);
-  } finally {
-    ctx.restore();
-  }
 }
 
 /** createCanvas(width, 60) 必须提供 2D context 和 PNG data URL 编码。 */

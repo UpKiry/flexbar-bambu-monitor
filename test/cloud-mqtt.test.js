@@ -352,6 +352,29 @@ test("asynchronous publish failure retains cooldown and hides errors", () => {
   client.stop();
 });
 
+test("presence only accepts exact nested events on the target report topic", () => {
+  const { client, created, reports } = makeClient({ now: () => 42 });
+  const presence = [];
+  client.onPresence((event) => presence.push(event));
+  client.start();
+  const send = (body, topic = reportTopic("DEV1")) => created[0].emit("message", topic, Buffer.from(JSON.stringify(body)));
+  send({ event: { event: "client.disconnected" } }, reportTopic("OTHER"));
+  send({ event: { event: "client.disconnected" }, print: { mc_percent: 70 } });
+  send({ event: { event: "client.connected" } });
+  send({ event: "client.disconnected" });
+  send({ event: { event: "disconnected" } });
+  send({ print: {} });
+  send({ info: {} });
+  send({ print: { mc_percent: 0 } });
+  assert.deepEqual(presence.filter((event) => event.type === "event").map((event) => event.event),
+    ["client.disconnected", "client.connected"]);
+  assert.equal(presence.filter((event) => event.type === "message").length, 7);
+  assert.equal(reports.some((report) => report.raw?.mc_percent === 70), false);
+  assert.equal(reports.at(-1).raw.mc_percent, 0);
+  assert.ok(presence.every((event) => event.receivedAt === 42));
+  client.stop();
+});
+
 test("wildcards and topic separators are rejected in device IDs", () => {
   for (const deviceId of ["abc/def", "abc+", "abc#", "abc\u0000"]) {
     const { client, created } = makeClient({ deviceId });

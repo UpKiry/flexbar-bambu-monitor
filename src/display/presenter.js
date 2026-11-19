@@ -1,13 +1,18 @@
 /**
- * 状态 → 展示模型（见 docs/云端监控设计方案.md §3.2）。
+ * 状态 → 展示模型（见 docs/架构设计.md「展示与绘制」）。
  *
  * 这里只负责"把状态翻译成一句话 + 一种语气"，不接触任何 FlexDesigner API，
  * 因此可以脱离宿主做单元测试。绘制的节流也在这里：绘制频率限制属于展示逻辑。
  */
 
+const {
+  FIELD_STALE_MS: REPORT_STALE_MS,
+  effectivePresenceState,
+  markIsFresh: policyMarkIsFresh,
+  fieldIsFresh: policyFieldIsFresh,
+} = require("../printer/observation-policy");
+
 const VIEWS = ["progress", "temperature", "task"];
-// 连接仍存在时也可能很久没有设备报告；阈值只表示数据旧，不表示设备离线。
-const REPORT_STALE_MS = 5 * 60_000;
 
 const TONES = {
   muted: "muted",
@@ -17,11 +22,32 @@ const TONES = {
   critical: "critical",
 };
 
-function fieldIsFresh(state, field, now) {
-  // 兼容未带字段级信息的旧状态；新模型缺少标记表示未报告。
-  if (!state?.freshness?.fields) return state?.reportStale !== true && Number.isFinite(state?.lastReportAt) && now - state.lastReportAt < REPORT_STALE_MS;
-  const mark = state.freshness.fields[field];
-  return Boolean(mark && mark.stale === false && Number.isFinite(mark.at) && now >= mark.at && now - mark.at < REPORT_STALE_MS);
+// presence 是展示快照，不写回设备观测。getter 可能尚未经过下一次 tick，故也守卫遥测时间。
+function presenceState(presence, now) {
+  return effectivePresenceState(presence, now);
+}
+
+function markIsFresh(mark, state, now, presence = state?.presence) {
+  return policyMarkIsFresh(mark, presence || null, now);
+}
+
+function fieldIsFresh(state, field, now, presence = state?.presence) {
+  return policyFieldIsFresh(state, field, now, presence);
+}
+
+function presenceDisplay(presence, link, now) {
+  if (!presence) return null;
+  if (link?.state !== "connected") return {
+    tone: TONES.warning, title: "云端连接中断", subtitle: "打印机状态未知，显示最后已知读数", icon: "cloud-off", stale: true,
+  };
+  const status = presenceState(presence, now);
+  const titles = { offline: "打印机离线", syncing: "等待打印机同步", unresponsive: "设备无响应", unknown: "打印机状态未知" };
+  if (status === "online") return null;
+  return {
+    tone: status === "offline" || status === "unresponsive" ? TONES.warning : TONES.muted,
+    title: titles[status] || titles.unknown,
+    subtitle: "显示最后已知读数", icon: status === "syncing" ? "clock" : "cloud-off", stale: true,
+  };
 }
 
 /**
@@ -34,10 +60,11 @@ function fieldIsFresh(state, field, now) {
  * @param {string} [input.printerName]
  * @param {object} [input.state] PrinterState
  * @param {object} [input.link] { state: 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'idle', lastError }
+ * @param {object} [input.presence] 设备在线状态，默认取 state.presence
  * @param {number} [input.now]
  * @returns {{ tone: string, title: string, subtitle: string, icon: string, stale: boolean }}
  */
-function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Date.now() }) {
+function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, presence = state?.presence, now = Date.now() }) {
   if (!signedIn) {
     return {
       tone: TONES.muted,
@@ -57,6 +84,10 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
     };
   }
 
+  const presenceStatus = presenceDisplay(presence, link, now);
+  if (presenceStatus) return presenceStatus;
+  // 显式参数也供字段级判断使用，保持原始 state 不变。
+  if (presence && state?.presence !== presence) state = { ...state, presence };
   const linkState = link?.state || "idle";
   if (linkState === "connecting") {
     return { tone: TONES.muted, title: "正在连接云端", subtitle: "", icon: "cloud", stale: true };
@@ -77,7 +108,7 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
 
   const activity = state.activity || "unknown";
   const hasFieldMarks = Boolean(state.freshness?.fields);
-  const freshError = hasFieldMarks
+  const freshError = hasFieldMarks || presence
     ? (state.printError && fieldIsFresh(state, "printError", now) ? state.printError
       : state.printErrorCode && fieldIsFresh(state, "printErrorCode", now) ? state.printErrorCode : null)
     : state.errorCode;
@@ -92,7 +123,7 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
     };
   }
 
-  const timedOut = Number.isFinite(state.lastReportAt) && now - state.lastReportAt >= REPORT_STALE_MS;
+  const timedOut = !presence && Number.isFinite(state.lastReportAt) && now - state.lastReportAt >= REPORT_STALE_MS;
   const relevantFields = ["activity"];
   if (activity === "printing" || activity === "paused") {
     if (state.progressPercent !== null) relevantFields.push("progressPercent");
@@ -100,7 +131,7 @@ function buildDisplay({ signedIn, authExpired, hasPrinter, state, link, now = Da
   } else if ((activity === "finished" || activity === "preparing") && state.taskName) relevantFields.push("taskName");
   else if (activity === "idle" && state.nozzle?.current !== null && state.nozzle?.current !== undefined) relevantFields.push("nozzle.current");
   const fieldsStale = hasFieldMarks && relevantFields.some((field) => !fieldIsFresh(state, field, now));
-  const stale = linkState !== "connected" || state.reportStale === true || timedOut || fieldsStale;
+  const stale = linkState !== "connected" || (!presence && state.reportStale === true) || timedOut || fieldsStale || Boolean(presence && !hasFieldMarks);
   if (stale) {
     return {
       tone: TONES.warning,
@@ -211,7 +242,7 @@ function nextView(view) {
 /**
  * 绘制节流。
  *
- * 设计文档 §6.4：数据到达立即更新内存；常规绘制最多每秒一次，
+ * docs/架构设计.md「展示与绘制」：数据到达立即更新内存；常规绘制最多每秒一次，
  * 状态切换、断线和故障可以立即更新。
  */
 function createDrawThrottle({ intervalMs = 1_000, now = () => Date.now() } = {}) {
@@ -279,7 +310,7 @@ function fingerprintDisplay(display, view) {
 }
 
 /**
- * 完成与故障通知按任务标识和状态转换去重（设计文档 §6.4）。
+ * 完成与故障通知按任务标识和状态转换去重（见 docs/架构设计.md「展示与绘制」）。
  * 返回 null 表示这条通知不应重复发送。
  */
 function createNotificationDeduper() {
@@ -313,6 +344,9 @@ module.exports = {
   TONES,
   buildDisplay,
   fieldIsFresh,
+  markIsFresh,
+  presenceState,
+  presenceDisplay,
   buildViewDetails,
   formatPercent,
   formatMinutes,

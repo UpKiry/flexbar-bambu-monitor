@@ -37,6 +37,8 @@ function makeFakeMqtt(mqttOverrides = {}) {
       fullStateRequests: 0,
       onStatus(fn) { handlers.status = fn; },
       onReport(fn) { handlers.report = fn; },
+      onPresence(fn) { handlers.presence = fn; },
+      pushPresence(event) { handlers.presence?.(event); },
       start() { instance.started = true; },
       stop() { instance.stopped = true; },
       requestFullState() { instance.fullStateRequests += 1; return mqttOverrides.requestFullState?.(instance) || { sent: true }; },
@@ -74,7 +76,7 @@ function makePlugin({ config = { region: "global", printerId: "", printerName: "
   };
 }
 
-function makeRuntime({ config, apiOverrides, plugin, drawDashboardFn, createCanvas, credentialStore = makeStore(), mqttOverrides = {} } = {}) {
+function makeRuntime({ config, apiOverrides, plugin, drawDashboardFn, createCanvas, credentialStore = makeStore(), mqttOverrides = {}, now = () => 9000 } = {}) {
   const host = plugin || makePlugin({ config });
   const { factory, created } = makeFakeMqtt(mqttOverrides);
   const logs = { errors: [], warns: [], infos: [] };
@@ -93,9 +95,9 @@ function makeRuntime({ config, apiOverrides, plugin, drawDashboardFn, createCanv
     configRetryDelayMs: 1,
     createMqttManager: (options) => {
       const { createPrinterManager } = require("../src/printer/printer-manager");
-      return createPrinterManager({ ...options, createMqttClient: factory, now: () => 9000 });
+      return createPrinterManager({ ...options, createMqttClient: factory, now });
     },
-    now: () => 9000,
+    now,
   });
   return { runtime, host, mqtt: created, logs };
 }
@@ -727,6 +729,39 @@ test("temperature and task views do not display stale fields as live", async () 
   assert.match(host.draws.at(-1).title, /数据已过期/);
 });
 
+test("runtime keeps broker, list snapshot and printer presence separate through offline and resync", async () => {
+  const { runtime, mqtt } = makeRuntime();
+  await runtime.start();
+  try {
+    await runtime.actions.login({ account: "a@b.c", password: "pw" });
+    const client = mqtt[0];
+    client.pushStatus({state: "connected", subscribed: true});
+    client.pushReport({raw: {gcode_state: "RUNNING", mc_percent: 0, heatbreak_fan_speed: "0"}, receivedAt: 9000});
+    let snapshot = await runtime.actions.status();
+    assert.equal(snapshot.printer.presence.state, "online");
+    assert.equal(snapshot.printer.state.presence.state, "online");
+    assert.equal(snapshot.devicesFetchedAt, 9000);
+    client.pushPresence({type: "event", event: "client.disconnected", receivedAt: 9000});
+    snapshot = await runtime.actions.status();
+    assert.equal(snapshot.printer.link.state, "connected");
+    assert.equal(snapshot.devices[0].online, true, "列表快照不冒充实时状态");
+    assert.equal(snapshot.printer.presence.state, "offline");
+    assert.equal(snapshot.display.title, "打印机离线");
+    assert.equal(snapshot.printer.state.activity, "printing");
+    assert.equal(snapshot.printer.state.fans.heatbreak, 0);
+    client.pushPresence({type: "event", event: "client.connected", receivedAt: 9000});
+    assert.equal((await runtime.actions.status()).display.title, "等待打印机同步");
+    client.pushReport({raw: {nozzle_temper: 30}, receivedAt: 9000});
+    snapshot = await runtime.actions.status();
+    assert.equal(snapshot.printer.presence.state, "online");
+    assert.equal(snapshot.printer.state.freshness.fields["fans.heatbreak"].stale, true);
+    client.pushStatus({state: "reconnecting", subscribed: false});
+    snapshot = await runtime.actions.status();
+    assert.equal(snapshot.printer.presence.state, "unknown");
+    assert.equal(snapshot.display.title, "云端连接中断");
+  } finally { await runtime.shutdown(); }
+});
+
 test("before the first report the key shows the waiting prompt in every view", async () => {
   const { runtime, host, mqtt } = makeRuntime();
   await runtime.start();
@@ -738,7 +773,7 @@ test("before the first report the key shows the waiting prompt in every view", a
   for (let i = 0; i < 3; i += 1) {
     await host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: { ...keys()[0] } } });
     await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.match(host.draws.at(-1).title, /等待打印机状态/);
+    assert.match(host.draws.at(-1).title, /等待打印机同步/);
   }
 });
 
@@ -884,6 +919,80 @@ test("按键独立选择设备并共享同一设备连接，退出时全部断�
   await runtime.shutdown();
 });
 
+test("默认设备与按键设备互换角色后只保留当前需求的连接", async () => {
+  const { runtime, host, mqtt } = makeRuntime({
+    config: { region: "global", printerId: "DEV1", printerName: "一号" },
+    apiOverrides: { fetchDevices: async () => [
+      { id: "DEV1", name: "一号" }, { id: "DEV2", name: "二号" },
+    ] },
+  });
+  await runtime.start();
+  try {
+    host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [
+      { ...keys()[0], data: { view: "progress", printerId: "DEV2" } },
+    ] });
+    await runtime.actions.login({ account: "a@b.c", password: "pw" });
+    assert.deepEqual(mqtt.map((client) => client.options.deviceId).sort(), ["DEV1", "DEV2"]);
+    for (const client of mqtt) client.pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+
+    // 默认设备改成按键设备：两条旧连接都必须先关闭，再按新需求重建。
+    const result = await runtime.actions.setPrinter({ printerId: "DEV2" });
+    assert.equal(result.status, "success");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(mqtt.slice(0, 2).every((client) => client.stopped), "旧角色的连接必须关闭");
+    const live = mqtt.filter((client) => !client.stopped);
+    assert.equal(live.length, 1, "同一设备只保留一条连接");
+    assert.equal(live[0].options.deviceId, "DEV2");
+
+    // 按键再指回旧默认设备：旧设备重新按需建立连接，当前默认设备保持。
+    host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [
+      { ...keys()[0], data: { view: "progress", printerId: "DEV1" } },
+    ] });
+    await new Promise((resolve) => setImmediate(resolve));
+    const after = mqtt.filter((client) => !client.stopped);
+    assert.deepEqual(after.map((client) => client.options.deviceId).sort(), ["DEV1", "DEV2"]);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("旧连接的迟到鉴权失败不能使新会话失效", async () => {
+  let count = 0;
+  const { runtime, host, mqtt } = makeRuntime({
+    config: { region: "global", printerId: "DEV1", printerName: "一号" },
+    apiOverrides: {
+      login: async () => ({ accessToken: `token-${++count}`, expiresInSeconds: 3600 }),
+      fetchDevices: async () => [{ id: "DEV1", name: "一号" }, { id: "DEV2", name: "二号" }],
+    },
+  });
+  await runtime.start();
+  try {
+    host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [
+      { ...keys()[0], data: { view: "progress", printerId: "DEV2" } },
+    ] });
+    await runtime.actions.login({ account: "a@b.c", password: "pw" });
+    const staleClients = [...mqtt];
+    assert.equal(staleClients.length, 2);
+
+    await runtime.actions.logout();
+    await runtime.actions.login({ account: "a@b.c", password: "pw" });
+    await new Promise((resolve) => setImmediate(resolve));
+    const freshClients = mqtt.filter((client) => !staleClients.includes(client));
+    assert.ok(freshClients.length >= 1);
+    assert.equal(freshClients[0].options.password, "token-2");
+
+    for (const client of staleClients) {
+      client.pushStatus({ state: CONNECTION_STATES.failed, lastError: { kind: "unauthorized", message: "stale" } });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    const status = await runtime.actions.status();
+    assert.equal(status.auth.state, "signed-in", "旧会话的鉴权失败不得登出新会话");
+    assert.equal(status.monitorBlockMessage, "", "旧会话事件不得撤销新会话的设备验证");
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
 test("按键选择不属于当前账号的设备不会连接", async () => {
   const { runtime, host, mqtt } = makeRuntime();
   await runtime.start();
@@ -917,6 +1026,8 @@ test("Direct Draw 设备触摸请求完整状态并显示反馈", async () => {
   await runtime.actions.login({ account: "a@b.c", password: "pw" });
   mqtt[0].pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(draws.at(-1).model, "X1 Carbon", "绘制必须取得当前设备的机型能力");
+  assert.equal(draws.at(-1).printerName, "X1-01");
   const directKey = directKeys[0];
   const drawsBeforeTouch = draws.length;
   host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: directKey } });
@@ -926,8 +1037,15 @@ test("Direct Draw 设备触摸请求完整状态并显示反馈", async () => {
   host.handlers.get("device.touch")({ serialNumber: "SN", x: 100, y: 20, state: "down" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(mqtt[0].fullStateRequests, 1, "Direct Draw 的 down 触摸请求当前设备完整状态");
-  assert.deepEqual(flexbarMessages.at(-1), ["SN", "已请求完整状态，等待设备上报", "success", "refresh", 1800]);
-  assert.equal(draws.length, drawsBeforeTouch, "屏幕触摸请求状态时不重绘详情页");
+  assert.deepEqual(draws.at(-1).feedback, { text: "已请求完整状态，等待设备上报", level: "success" });
+  assert.equal(flexbarMessages.length, 0, "Canvas 反馈不再调用原生 snackbar");
+  for (let n = 0; n < 3; n += 1) {
+    host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: directKey } });
+    host.handlers.get("device.touch")({ serialNumber: "SN", x: 100, y: 20, state: "down" });
+  }
+  assert.equal(mqtt[0].fullStateRequests, 1, "同次点击重复 down 不得再次请求，即便绘制会话被替换");
+  assert.equal(flexbarMessages.length, 0, "重复触摸也不会触发原生弹窗");
+  assert.equal(draws.length, drawsBeforeTouch + 1, "触摸反馈作为同一 Canvas 的一帧显示");
 
   host.handlers.get("plugin.dead")({ serialNumber: "SN", keys: keys() });
   const drawsAfterDead = draws.length;
@@ -939,6 +1057,58 @@ test("Direct Draw 设备触摸请求完整状态并显示反馈", async () => {
   assert.equal(draws.length, drawsAfterDead);
 });
 
+
+test("刷新反馈在同一绘制层随遥测更新并到期消失，不调用原生弹窗", async () => {
+  let time = 9000;
+  let result = { sent: true };
+  const frames = [];
+  const { runtime, host, mqtt } = makeRuntime({
+    now: () => time,
+    createCanvas: () => ({}), drawDashboardFn: async args => { frames.push(args); },
+    mqttOverrides: { requestFullState: () => result },
+  });
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  await runtime.start();
+  try {
+    await runtime.actions.login({ account: "a@b.c", password: "pw" });
+    mqtt[0].pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+    const directKeys = keys().map(key => ({ ...key, cfg: { keyType: "directDraw" } }));
+    const alive = serialNumber => host.handlers.get("plugin.alive")({ serialNumber, keys: directKeys });
+    const touch = serialNumber => host.handlers.get("device.touch")({ serialNumber, state: "down" });
+    const frame = serial => frames.filter(f => f.serialNumber === serial).at(-1);
+    alive("S1"); alive("S2"); await flush();
+    touch("S1"); await flush();
+    assert.equal(frame("S1").feedback.text, "已请求完整状态，等待设备上报");
+    assert.equal(frame("S2").feedback, null, "反馈不串屏");
+    mqtt[0].pushReport({ raw: { gcode_state: "RUNNING", mc_percent: 42 }, receivedAt: time });
+    await flush();
+    assert.equal(frame("S1").state.progressPercent, 42);
+    assert.equal(frame("S1").feedback.text, "已请求完整状态，等待设备上报", "遥测绘制保留当前反馈");
+    result = { sent: false, reason: "cooldown", retryInMs: 3200 };
+    time += 1799;
+    touch("S1");
+    assert.equal(mqtt[0].fullStateRequests, 1);
+    touch("S2"); await flush();
+    assert.equal(frame("S2").feedback.text, "请稍候 4 秒再请求");
+    time += 1;
+    await runtime.renderAll(); await flush();
+    assert.equal(frame("S1").feedback, null, "到期恢复任务名");
+    touch("S1"); await flush();
+    assert.equal(mqtt[0].fullStateRequests, 3);
+    assert.equal(frame("S1").feedback.level, "warning");
+    touch("S1");
+    assert.equal(mqtt[0].fullStateRequests, 3);
+    host.handlers.get("plugin.dead")({ serialNumber: "S1", keys: directKeys });
+    alive("S1"); await flush();
+    assert.equal(frame("S1").feedback, null, "退出重进清理反馈");
+    touch("S1"); await flush();
+    assert.equal(mqtt[0].fullStateRequests, 4);
+    host.handlers.get("device.status")([{ serialNumber: "S1", status: "disconnected" }]);
+    alive("S1"); await flush();
+    assert.equal(frame("S1").feedback, null, "断开重连清理反馈");
+    assert.equal(host.flexbarMessages.length, 0, "成功、遥测重绘、冷却、退出均不调用原生通知");
+  } finally { await runtime.shutdown(); }
+});
 
 test("旧类型按键不会被送去 Direct Draw", async () => {
   const host = makePlugin();

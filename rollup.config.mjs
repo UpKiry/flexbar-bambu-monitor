@@ -3,15 +3,13 @@ import nodeResolve from "@rollup/plugin-node-resolve";
 import terser from "@rollup/plugin-terser";
 import path from "node:path";
 import url from "node:url";
-import json from '@rollup/plugin-json';
-import { glob } from 'glob'
+import json from "@rollup/plugin-json";
+import { glob } from "glob";
+
 const isWatching = !!process.env.ROLLUP_WATCH;
 const flexPlugin = "com.upkiry.bambumonitor.plugin";
 
-/**
- * @type {import('rollup').RollupOptions}
- */
-const config = {
+const backend = {
   input: "src/plugin.js",
   output: {
     file: `${flexPlugin}/backend/plugin.cjs`,
@@ -36,7 +34,7 @@ const config = {
     nodeResolve({
       browser: false,
       exportConditions: ["node"],
-      preferBuiltins: true
+      preferBuiltins: true,
     }),
     commonjs(),
     !isWatching && terser(),
@@ -44,10 +42,25 @@ const config = {
       name: "emit-module-package-file",
       generateBundle() {
         this.emitFile({ fileName: "package.json", source: `{ "type": "module" }`, type: "asset" });
-      }
-    }
+      },
+    },
   ],
-  external: id => id === '@napi-rs/canvas' || id.endsWith('.node')
+  external: (id) => id === "@napi-rs/canvas" || id.endsWith(".node"),
 };
 
-export default config;
+const adminClient = {
+  input: "src/admin/client/main.js",
+  output: {
+    file: `${flexPlugin}/resources/admin/app.js`,
+    format: "iife",
+    name: "BambuAdmin",
+    sourcemap: false,
+  },
+  plugins: [
+    nodeResolve({ browser: true }),
+    commonjs(),
+    !isWatching && terser(),
+  ],
+};
+
+export default [backend, adminClient];

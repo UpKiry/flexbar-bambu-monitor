@@ -26,26 +26,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build
+        run: npm run build
+
       - name: Run tests
         run: npm test
 
   build:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
-    permissions: write-all
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
 
     steps:
       - name: Code checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install dependencies
-        run: npm i
+        run: npm ci
     
       - name: Install FlexCli
         run: npm install -g @eniac/flexcli
@@ -56,7 +60,14 @@ jobs:
       - name: Pack Plugin
         run: npm run plugin:pack
 
+      - name: Generate package checksum
+        run: sha256sum com.upkiry.bambumonitor.flexplugin > com.upkiry.bambumonitor.flexplugin.sha256
+
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: com.upkiry.bambumonitor.flexplugin
+          name: Bambu Monitor ${{ github.ref_name }}
+          body_path: docs/releases/${{ github.ref_name }}.md
+          files: |
+            com.upkiry.bambumonitor.flexplugin
+            com.upkiry.bambumonitor.flexplugin.sha256

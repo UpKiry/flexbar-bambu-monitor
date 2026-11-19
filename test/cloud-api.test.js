@@ -20,6 +20,14 @@ function makeRequester(responses) {
   };
 }
 
+test("device online accepts booleans and preserves missing or invalid values as unknown", async () => {
+  const values = [true, false, undefined, null, 0, 1, "true", "false"];
+  const requester = makeRequester([{ body: { devices: values.map((online, index) => ({ dev_id: `D${index}`, online })) } }]);
+  const api = new CloudApi({ requestFn: requester.fn });
+  assert.deepEqual((await api.fetchDevices("tok")).map((device) => device.online),
+    [true, false, null, null, null, null, null, null]);
+});
+
 test("login returns tokens and never leaks them in the request log", async () => {
   const requester = makeRequester([{ body: { accessToken: "tok", refreshToken: "ref", expiresIn: 7776000, loginType: "" } }]);
   const api = new CloudApi({ region: "global", requestFn: requester.fn });
