@@ -1,7 +1,7 @@
 {
     "name": "Bambu Monitor",
     "uuid": "com.upkiry.bambumonitor",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "author": "upkiry",
     "entry": "backend/plugin.cjs",
     "description": "在 Flexbar 上监控 Bambu Lab 打印机的云端状态与打印进度",
@@ -37,10 +37,10 @@
         "children": [
             {
                 "title": "打印机状态",
-                "tip": "查看所选 Bambu 打印机的云端状态、打印进度与温度",
+                "tip": "选择打印机，点击查看全屏状态",
                 "cid": "com.upkiry.bambumonitor.monitor",
                 "config": {
-                    "keyType": "default",
+                    "keyType": "directDraw",
                     "clickable": true,
                     "platform": [
                         "windows",
@@ -52,7 +52,7 @@
                     "width": 240
                 },
                 "data": {
-                    "view": "progress"
+                    "printerId": ""
                 }
             }
         ]

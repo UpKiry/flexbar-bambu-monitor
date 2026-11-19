@@ -572,11 +572,11 @@ test("clicking a monitor key cycles its view", async () => {
 
   await host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: { ...keys()[0] } } });
   const status = await host.handlers.get("ui.message")({ action: "status" });
-  assert.deepEqual(status.views, [{ uid: 1, view: "temperature" }]);
+  assert.deepEqual(status.views, [{ uid: 1, view: "temperature", serialNumber: "SN" }]);
 
   await host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: { ...keys()[0] } } });
   const status2 = await host.handlers.get("ui.message")({ action: "status" });
-  assert.deepEqual(status2.views, [{ uid: 1, view: "task" }]);
+  assert.deepEqual(status2.views, [{ uid: 1, view: "task", serialNumber: "SN" }]);
 });
 
 test("keys on disconnected devices are forgotten", async () => {
@@ -819,4 +819,144 @@ test("configuration changes are saved and applied in request order", async () =>
   assert.equal(runtime.config.printerId, "A");
   assert.equal(runtime.config.region, "china");
   assert.deepEqual(host.savedConfigs.at(-1), runtime.config);
+});
+
+
+test("按键独立选择设备并共享同一设备连接，退出时全部断开", async () => {
+  const { runtime, host, mqtt } = makeRuntime({ apiOverrides: { fetchDevices: async () => [
+    { id: "DEV1", name: "一号" }, { id: "DEV2", name: "二号" },
+  ] } });
+  await runtime.start();
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [
+    { ...keys()[0], uid: 1, data: { view: "progress", printerId: "DEV1" } },
+    { ...keys()[0], uid: 2, data: { view: "progress", printerId: "DEV2" } },
+    { ...keys()[0], uid: 3, data: { view: "progress", printerId: "DEV2" } },
+  ] });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  assert.equal(mqtt.length, 2);
+  for (const client of mqtt) {
+    client.pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+    client.pushReport({ raw: { gcode_state: "RUNNING", mc_percent: client.options.deviceId === "DEV1" ? 11 : 88 }, receivedAt: 9000 });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const [uid, progress] of [[1, "11%"], [2, "88%"], [3, "88%"]]) {
+    assert.ok(host.draws.some((draw) => draw.uid === uid && draw.title.includes(progress)));
+  }
+  await runtime.actions.logout();
+  assert.ok(mqtt.every((client) => client.stopped));
+  await runtime.shutdown();
+});
+
+test("按键选择不属于当前账号的设备不会连接", async () => {
+  const { runtime, host, mqtt } = makeRuntime();
+  await runtime.start();
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [{ ...keys()[0], data: { printerId: "OTHER" } }] });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(mqtt.every((client) => client.options.deviceId !== "OTHER"));
+  assert.ok(host.draws.some((draw) => draw.title.includes("无法连接设备")));
+  await runtime.shutdown();
+});
+
+
+test("详情页激活后绘制，dead 和退出阻止后续绘制", async () => {
+  const host = makePlugin();
+  const draws = [];
+  const runtime = createPluginRuntime({
+    plugin: host, credentialStore: makeStore(), createApi: () => makeApi(),
+    createCanvas: () => ({}), drawDashboardFn: async (args) => { draws.push(args); },
+  });
+  await runtime.start();
+  const directKeys = keys().map((key) => ({ ...key, cfg: { keyType: "directDraw" } }));
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: directKeys });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(draws.length, 1);
+  assert.equal(draws[0].serialNumber, "SN");
+  assert.equal(host.draws.length, 0, "详情页激活时不能用普通绘制覆盖触摸面");
+  host.handlers.get("plugin.dead")({ serialNumber: "SN", keys: keys() });
+  await runtime.renderAll({ urgent: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(draws.length, 1);
+  await runtime.shutdown();
+  await runtime.renderAll({ urgent: true });
+  assert.equal(draws.length, 1);
+});
+
+
+test("旧类型按键不会被送去 Direct Draw", async () => {
+  const host = makePlugin();
+  const draws = [];
+  const runtime = createPluginRuntime({
+    plugin: host, credentialStore: makeStore(), createApi: () => makeApi(),
+    createCanvas: () => ({}), drawDashboardFn: async (args) => { draws.push(args); },
+  });
+  await runtime.start();
+  const legacy = { ...keys()[0], cfg: { keyType: "default" } };
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [legacy] });
+  host.handlers.get("plugin.data")({ serialNumber: "SN", data: { key: legacy } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(draws.length, 0);
+  await runtime.shutdown();
+});
+
+test("设备刷新等待所有旧连接关闭，并丢弃旧会话结果", async () => {
+  let count = 0;
+  const { runtime, host, mqtt } = makeRuntime({
+    config: { region: "global", printerId: "DEV1", printerName: "一号" },
+    apiOverrides: {
+      login: async () => ({ accessToken: `token-${++count}`, expiresInSeconds: 3600 }),
+      fetchDevices: async () => [{ id: "DEV1", name: "一号" }, { id: "DEV2", name: "二号" }],
+    },
+  });
+  await runtime.start();
+  host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: [{ ...keys()[0], data: { printerId: "DEV2" } }] });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  assert.equal(mqtt.length, 2);
+  const stops = mqtt.map(() => deferred());
+  mqtt.forEach((client, index) => { client.stop = () => stops[index].promise; });
+  const oldRefresh = runtime.actions.refreshDevices();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt.length, 2);
+  const logout = runtime.actions.logout();
+  const login = runtime.actions.login({ account: "a@b.c", password: "pw" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt.length, 2);
+  stops[0].resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt.length, 2);
+  stops[1].resolve();
+  assert.equal((await oldRefresh).status, "cancelled");
+  await logout;
+  assert.equal((await login).status, "success");
+  assert.equal(mqtt.length, 4);
+  assert.ok(mqtt.slice(2).every((client) => client.options.password === "token-2" && !client.stopped));
+  await runtime.shutdown();
+});
+
+test("不同 Flexbar 的相同 uid 保持独立的设备、视图和绘制节流", async () => {
+  const { runtime, host, mqtt } = makeRuntime({ apiOverrides: { fetchDevices: async () => [
+    { id: "DEV1", name: "一号" }, { id: "DEV2", name: "二号" },
+  ] } });
+  await runtime.start();
+  const key1 = { ...keys()[0], data: { view: "progress", printerId: "DEV1" } };
+  const key2 = { ...keys()[0], data: { view: "progress", printerId: "DEV2" } };
+  host.handlers.get("plugin.alive")({ serialNumber: "SN1", keys: [key1] });
+  host.handlers.get("plugin.alive")({ serialNumber: "SN2", keys: [key2] });
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  for (const client of mqtt) {
+    client.pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+    client.pushReport({ raw: { gcode_state: "RUNNING", mc_percent: client.options.deviceId === "DEV1" ? 11 : 88 }, receivedAt: 9000 });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(host.draws.some((draw) => draw.serial === "SN1" && draw.title.includes("11%")));
+  assert.ok(host.draws.some((draw) => draw.serial === "SN2" && draw.title.includes("88%")));
+  host.handlers.get("plugin.data")({ serialNumber: "SN1", data: { evt: "click", key: key1 } });
+  const status = await runtime.actions.status();
+  assert.deepEqual(status.views, [
+    { uid: 1, view: "temperature", serialNumber: "SN1" },
+    { uid: 1, view: "progress", serialNumber: "SN2" },
+  ]);
+  host.handlers.get("device.status")([{ serialNumber: "SN2", status: "connected" }]);
+  assert.deepEqual((await runtime.actions.status()).views, [{ uid: 1, view: "progress", serialNumber: "SN2" }]);
+  await runtime.shutdown();
 });

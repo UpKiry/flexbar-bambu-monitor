@@ -47,7 +47,7 @@ const config = {
       }
     }
   ],
-  external: id => id.endsWith('.node')
+  external: id => id === '@napi-rs/canvas' || id.endsWith('.node')
 };
 
 export default config;

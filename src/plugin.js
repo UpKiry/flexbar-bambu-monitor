@@ -1,5 +1,8 @@
 const path = require("node:path");
 const { plugin, logger } = require("@eniac/flexdesigner");
+// FlexDesigner 宿主提供原生 Canvas，避免将平台专用二进制打入插件。
+const { createCanvas, GlobalFonts } = require("@napi-rs/canvas");
+const { registerDashboardFont } = require("./display/fonts");
 const { createPluginRuntime } = require("./runtime");
 const { createAdminServer } = require("./admin/server");
 
@@ -10,7 +13,8 @@ const { createAdminServer } = require("./admin/server");
  * 以便脱离宿主环境做单元测试。
  */
 const pluginDirectory = plugin.directory || path.join(__dirname, "..");
-const runtime = createPluginRuntime({ plugin, logger });
+registerDashboardFont(GlobalFonts);
+const runtime = createPluginRuntime({ plugin, logger, createCanvas });
 const admin = createAdminServer({
   runtime,
   staticDir: path.join(pluginDirectory, "resources", "admin"),
