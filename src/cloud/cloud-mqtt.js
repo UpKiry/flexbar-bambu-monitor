@@ -10,11 +10,13 @@
  */
 
 const { performance } = require("node:perf_hooks");
+const { mapAmsIdentities } = require("../printer/state-mapper");
+const { sanitizePayload } = require("../admin/debug-redaction");
 
 const TOPIC_PREFIX = "device";
 const MAX_REPORT_BYTES = 256 * 1024;
-// 共享于进程内所有客户端；切换设备或重建客户端不能绕过冷却。
-// 进程退出后记录会丢失，跨重启持久化需要另行实现。
+const PUSHALL_COOLDOWN_MS = 5_000;
+// Share the cooldown across clients in this process so replacing a connection cannot bypass it.
 const pushallCooldowns = new Map();
 
 function validDeviceId(deviceId) {
@@ -74,6 +76,7 @@ const CONNECTION_STATES = {
  * @param {object} options.logger
  * @param {(url: string, options: object) => object} [options.createClient]
  * @param {() => number} [options.now]
+ * @param {() => number} [options.cooldownNow]
  * @param {() => number} [options.random]
  */
 function createCloudMqttClient({
@@ -83,6 +86,7 @@ function createCloudMqttClient({
   password,
   deviceId,
   logger,
+  onFrame,
   createClient = defaultCreateClient,
   now = () => Date.now(),
   cooldownNow = () => performance.now(),
@@ -90,7 +94,6 @@ function createCloudMqttClient({
   baseBackoffMs = 2_000,
   maxBackoffMs = 60_000,
   keepaliveSeconds = 60,
-  pushallCooldownMs = 5 * 60_000,
   closeTimeoutMs = 5_000,
 }) {
   let client = null;
@@ -191,23 +194,40 @@ function createCloudMqttClient({
     return pending;
   }
 
+  function captureFrame(topic, payload, truncated = false) {
+    if (typeof onFrame !== "function") return;
+    try {
+      const safe = sanitizePayload(payload);
+      const result = onFrame({ protocol: "mqtt", source: topic, at: now(), ...safe, truncated: truncated || safe.truncated });
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch {
+      // Observers must not prevent business handling, including non-print JSON.
+    }
+  }
+
   function handleMessage(topic, payload) {
-    if (topic !== reportTopic(deviceId) || !Buffer.isBuffer(payload) || payload.length > MAX_REPORT_BYTES) return;
+    if (topic !== reportTopic(deviceId) || !Buffer.isBuffer(payload)) return;
+    if (payload.length > MAX_REPORT_BYTES) {
+      captureFrame(topic, { oversize: true, bodyOmitted: true, bytes: payload.length }, true);
+      return;
+    }
     let parsed;
     try {
       parsed = JSON.parse(payload.toString());
     } catch {
+      captureFrame(topic, { parseError: true, bodyOmitted: true, bytes: payload.length });
       logger?.warn?.("收到无法解析的云端报文，已忽略");
       return;
     }
-    const raw = parsed?.print;
-    if (!raw || typeof raw !== "object") {
-      return;
-    }
-    if (raw.command && raw.command !== "push_status" && raw.command !== "pushall") return;
+    captureFrame(topic, parsed);
+    const candidate = parsed?.print;
+    const raw = candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+      (!candidate.command || candidate.command === "push_status" || candidate.command === "pushall") ? candidate : null;
+    const amsIdentities = mapAmsIdentities(parsed?.info?.module);
+    if (!raw && !amsIdentities.length) return;
     if (!reportHandler) return;
     try {
-      reportHandler({ raw, receivedAt: now() });
+      reportHandler({ ...(raw ? { raw } : {}), ...(amsIdentities.length ? { amsIdentities } : {}), receivedAt: now() });
     } catch {
       logger?.error?.("处理云端报文失败");
     }
@@ -341,8 +361,7 @@ function createCloudMqttClient({
     /**
      * 主动请求完整状态。
      *
-     * 这是状态查询而不是打印控制；P1P 上每 5 分钟一次都可能造成卡顿，
-     * 因此这里强制冷却，和重连、手动刷新共享限制。
+     * 这是只读状态查询，不包含打印控制命令；同一设备至少间隔 5 秒。
      */
     requestFullState() {
       if (!client || state !== CONNECTION_STATES.connected) return { sent: false, reason: "not-connected" };
@@ -354,8 +373,8 @@ function createCloudMqttClient({
       if (expiry !== undefined) {
         return { sent: false, reason: "cooldown", retryInMs: expiry - stamp };
       }
-      // 一旦尝试发送便保守计入冷却：异常和异步错误都无法证明设备没有收到。
-      pushallCooldowns.set(deviceId, stamp + pushallCooldownMs);
+      // 一旦尝试发送便计入冷却，异步错误也无法证明设备没有收到。
+      pushallCooldowns.set(deviceId, stamp + PUSHALL_COOLDOWN_MS);
       let publishFailed = false;
       try {
         client.publish(

@@ -1,0 +1,22 @@
+{
+  "sourceCommit": "8e524a39d4c4cd0541801c1c46d2f77debb0bf1d",
+  "sourceURL": "https://github.com/bambulab/BambuStudio/tree/8e524a39d4c4cd0541801c1c46d2f77debb0bf1d/resources/printers",
+  "models": [
+    { "id": "BL-P001", "name": "X1C", "aliases": ["Bambu Lab X1 Carbon", "X1C", "X1Carbon", "3DPrinter-X1-Carbon"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "BL-P002", "name": "X1", "aliases": ["Bambu Lab X1", "3DPrinter-X1"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "C11", "name": "P1P", "aliases": ["Bambu Lab P1P"], "chamber": false, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "C12", "name": "P1S", "aliases": ["Bambu Lab P1S"], "chamber": false, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "C13", "name": "X1E", "aliases": ["Bambu Lab X1E"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "N1", "name": "A1 mini", "aliases": ["Bambu Lab A1 mini"], "chamber": false, "auxiliaryFan": false, "chamberFan": false, "amsType": "f1" },
+    { "id": "N2S", "name": "A1", "aliases": ["Bambu Lab A1"], "chamber": false, "auxiliaryFan": false, "chamberFan": false, "amsType": "f1" },
+    { "id": "N6", "name": "X2D", "aliases": ["Bambu Lab X2D", "N6-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "N7", "name": "P2S", "aliases": ["Bambu Lab P2S", "N7-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "N8", "name": "N8", "aliases": ["Bambu Lab N8", "N8-V2"], "chamber": null, "auxiliaryFan": null, "chamberFan": null, "amsType": "generic" },
+    { "id": "N9", "name": "A2L", "aliases": ["Bambu Lab A2L"], "chamber": false, "auxiliaryFan": false, "chamberFan": false, "amsType": "generic" },
+    { "id": "N10", "name": "H3C", "aliases": ["Bambu Lab H3C", "N10-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "O1C", "name": "H2C", "sourceIds": ["O1C", "O1C2"], "aliases": ["Bambu Lab H2C", "O1C2", "O1C2-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "O1D", "name": "H2D", "aliases": ["Bambu Lab H2D", "O1D-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "O1E", "name": "H2D Pro", "aliases": ["Bambu Lab H2D Pro", "O1E-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" },
+    { "id": "O1S", "name": "H2S", "aliases": ["Bambu Lab H2S", "O1S-V2"], "chamber": true, "auxiliaryFan": true, "chamberFan": true, "amsType": "generic" }
+  ]
+}

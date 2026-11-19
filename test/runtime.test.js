@@ -26,7 +26,7 @@ function makeApi(overrides = {}) {
   };
 }
 
-function makeFakeMqtt() {
+function makeFakeMqtt(mqttOverrides = {}) {
   const created = [];
   const factory = (options) => {
     const handlers = {};
@@ -34,11 +34,12 @@ function makeFakeMqtt() {
       options,
       started: false,
       stopped: false,
+      fullStateRequests: 0,
       onStatus(fn) { handlers.status = fn; },
       onReport(fn) { handlers.report = fn; },
       start() { instance.started = true; },
       stop() { instance.stopped = true; },
-      requestFullState: () => ({ sent: true }),
+      requestFullState() { instance.fullStateRequests += 1; return mqttOverrides.requestFullState?.(instance) || { sent: true }; },
       pushStatus(status) { handlers.status?.(status); },
       pushReport(report) { handlers.report?.(report); },
     };
@@ -52,11 +53,13 @@ function makePlugin({ config = { region: "global", printerId: "", printerName: "
   const handlers = new Map();
   const draws = [];
   const savedConfigs = [];
+  const flexbarMessages = [];
   let current = { ...config };
   return {
     handlers,
     draws,
     savedConfigs,
+    flexbarMessages,
     on: (type, handler) => handlers.set(type, handler),
     getConfig: async () => current,
     setConfig: async (next) => {
@@ -67,12 +70,13 @@ function makePlugin({ config = { region: "global", printerId: "", printerName: "
     draw: async (serial, key, format) => {
       draws.push({ serial, uid: key.uid, title: key.title, format, style: { ...key.style } });
     },
+    showFlexbarSnackbarMessage: async (...args) => { flexbarMessages.push(args); },
   };
 }
 
-function makeRuntime({ config, apiOverrides, plugin, credentialStore = makeStore() } = {}) {
+function makeRuntime({ config, apiOverrides, plugin, drawDashboardFn, createCanvas, credentialStore = makeStore(), mqttOverrides = {} } = {}) {
   const host = plugin || makePlugin({ config });
-  const { factory, created } = makeFakeMqtt();
+  const { factory, created } = makeFakeMqtt(mqttOverrides);
   const logs = { errors: [], warns: [], infos: [] };
   const runtime = createPluginRuntime({
     plugin: host,
@@ -84,6 +88,8 @@ function makeRuntime({ config, apiOverrides, plugin, credentialStore = makeStore
     },
     createApi: () => makeApi(apiOverrides),
     credentialStore,
+    ...(drawDashboardFn ? { drawDashboardFn } : {}),
+    ...(createCanvas ? { createCanvas } : {}),
     configRetryDelayMs: 1,
     createMqttManager: (options) => {
       const { createPrinterManager } = require("../src/printer/printer-manager");
@@ -890,27 +896,47 @@ test("按键选择不属于当前账号的设备不会连接", async () => {
 });
 
 
-test("详情页激活后绘制，dead 和退出阻止后续绘制", async () => {
-  const host = makePlugin();
+test("Direct Draw 设备触摸请求完整状态并显示反馈", async () => {
+  const host = makePlugin({ config: { region: "global", printerId: "DEV1", printerName: "X1-01" } });
   const draws = [];
-  const runtime = createPluginRuntime({
-    plugin: host, credentialStore: makeStore(), createApi: () => makeApi(),
-    createCanvas: () => ({}), drawDashboardFn: async (args) => { draws.push(args); },
+  const { runtime, mqtt } = makeRuntime({
+    plugin: host,
+    drawDashboardFn: async (args) => { draws.push(args); },
+    createCanvas: () => ({}),
+    mqttOverrides: { requestFullState: () => ({ sent: true }) },
   });
+  const { flexbarMessages } = host;
   await runtime.start();
-  const directKeys = keys().map((key) => ({ ...key, cfg: { keyType: "directDraw" } }));
+  const directKeys = keys().map((key) => ({ ...key, data: { view: "temperature" }, cfg: { keyType: "directDraw" } }));
   host.handlers.get("plugin.alive")({ serialNumber: "SN", keys: directKeys });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(draws.length, 1);
   assert.equal(draws[0].serialNumber, "SN");
   assert.equal(host.draws.length, 0, "详情页激活时不能用普通绘制覆盖触摸面");
+
+  await runtime.actions.login({ account: "a@b.c", password: "pw" });
+  mqtt[0].pushStatus({ state: CONNECTION_STATES.connected, subscribed: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  const directKey = directKeys[0];
+  const drawsBeforeTouch = draws.length;
+  host.handlers.get("plugin.data")({ serialNumber: "SN", data: { evt: "click", key: directKey } });
+  assert.equal(mqtt[0].fullStateRequests, 0, "Direct Draw 不依赖普通 plugin.data 点击事件");
+  host.handlers.get("device.touch")({ serialNumber: "SN", x: 100, y: 20, state: "pressing" });
+  assert.equal(mqtt[0].fullStateRequests, 0, "pressing 状态不是一次完成的点击，不重复请求");
+  host.handlers.get("device.touch")({ serialNumber: "SN", x: 100, y: 20, state: "down" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mqtt[0].fullStateRequests, 1, "Direct Draw 的 down 触摸请求当前设备完整状态");
+  assert.deepEqual(flexbarMessages.at(-1), ["SN", "已请求完整状态，等待设备上报", "success", "refresh", 1800]);
+  assert.equal(draws.length, drawsBeforeTouch, "屏幕触摸请求状态时不重绘详情页");
+
   host.handlers.get("plugin.dead")({ serialNumber: "SN", keys: keys() });
+  const drawsAfterDead = draws.length;
   await runtime.renderAll({ urgent: true });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(draws.length, 1);
+  assert.equal(draws.length, drawsAfterDead);
   await runtime.shutdown();
   await runtime.renderAll({ urgent: true });
-  assert.equal(draws.length, 1);
+  assert.equal(draws.length, drawsAfterDead);
 });
 
 
@@ -990,4 +1016,28 @@ test("不同 Flexbar 的相同 uid 保持独立的设备、视图和绘制节流
   host.handlers.get("device.status")([{ serialNumber: "SN2", status: "connected" }]);
   assert.deepEqual((await runtime.actions.status()).views, [{ uid: 1, view: "progress", serialNumber: "SN2" }]);
   await runtime.shutdown();
+});
+
+
+test("后台能力按选中设备和实时数据计算，不跨设备沿用", async () => {
+  const {runtime, mqtt} = makeRuntime({apiOverrides: {fetchDevices: async () => [
+    {id: "A", name: "A", model: "A1"}, {id: "X", name: "X", model: "X1 Carbon"},
+  ]}});
+  await runtime.start();
+  try {
+    await runtime.actions.login({account: "a@b.c", password: "pw"});
+    await runtime.actions.setPrinter({printerId: "A"});
+    mqtt.at(-1).pushReport({raw: {chamber_temper: 0, big_fan1_speed: 0,
+      ams: {ams: [{id: 0, tray: [{id: 0, remain: 50}]}]}}, receivedAt: 9000});
+    const a = (await runtime.actions.status()).printer.capabilities;
+    assert.equal(a.sensors.chamber, false);
+    assert.equal(a.sensors.fanAuxiliary, false);
+    assert.equal(a.ams["0"].type, "ams-lite");
+    assert.equal(a.ams["0"].remaining, false);
+    await runtime.actions.setPrinter({printerId: "X"});
+    const x = (await runtime.actions.status()).printer.capabilities;
+    assert.deepEqual(x.ams, {});
+    mqtt.at(-1).pushReport({raw: {chamber_temper: 35}, receivedAt: 9100});
+    assert.equal((await runtime.actions.status()).printer.capabilities.sensors.chamber, true);
+  } finally { await runtime.shutdown(); }
 });

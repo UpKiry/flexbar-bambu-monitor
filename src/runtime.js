@@ -5,6 +5,7 @@ const { createAuthService, STATES } = require("./auth/auth-service");
 const { createCredentialStore } = require("./auth/credential-store");
 const { createDiagnostics } = require("./admin/diagnostics");
 const { createPrinterManager } = require("./printer/printer-manager");
+const { getPrinterCapabilities } = require("./printer/capabilities");
 const { drawKey, toKeyTitle } = require("./display/key-renderer");
 const { drawDashboard } = require("./display/dashboard");
 const {
@@ -57,9 +58,18 @@ function createPluginRuntime({
   const safeLogger = createSafeLogger(logger, {
     onRecord: (entry) => diagnostics.recordLog?.(entry),
   });
+  const onFrame = (event) => {
+    try {
+      const result = diagnostics.recordFrame?.(event);
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch {
+      // Diagnostic observers are optional.
+    }
+  };
   const createApiFn = createApi || ((region) => new CloudApi({
     region,
     onRequest: (event) => diagnostics.recordRequest?.(event),
+    onFrame,
   }));
   const auth = createAuthService({
     createApi: createApiFn,
@@ -67,7 +77,7 @@ function createPluginRuntime({
     logger: safeLogger,
     now,
   });
-  const printer = createMqttManager({ logger: safeLogger, now });
+  const printer = createMqttManager({ logger: safeLogger, now, onFrame });
   const throttles = new Map();
   const additionalPrinters = new Map();
   const closingManagers = new Map();
@@ -280,7 +290,7 @@ function createPluginRuntime({
       if (!device) continue;
       let entry = additionalPrinters.get(id);
       if (!entry) {
-        const manager = createMqttManager({ logger: safeLogger, now });
+        const manager = createMqttManager({ logger: safeLogger, now, onFrame });
         entry = { manager, token: null };
         additionalPrinters.set(id, entry);
         manager.subscribe((change) => {
@@ -556,10 +566,35 @@ function createPluginRuntime({
     renderAll({ urgent: true }).catch((error) => logError("初始绘制失败", error));
   });
 
+  // Direct Draw 页面不走普通按键的 plugin.data 点击事件；SDK 将屏幕触摸单独报告为 device.touch。
+  plugin.on("device.touch", (payload) => {
+    if (payload?.state !== "down") return;
+    const session = dashboards.get(payload.serialNumber);
+    if (!session) return;
+    const printerId = keyPrinterId(session.key);
+    const blocked = monitorBlockMessage(printerId);
+    if (blocked) {
+      safeLogger.warn(`触摸屏幕未请求完整状态：${blocked}`);
+      return;
+    }
+    const result = printerFor(printerId)?.requestFullState();
+    const level = result?.sent ? "success" : result?.reason === "cooldown" || result?.reason === "not-connected" ? "warning" : "error";
+    const message = result?.sent ? "已请求完整状态，等待设备上报"
+      : result?.reason === "cooldown" ? `请稍候 ${Math.max(1, Math.ceil((result.retryInMs || 0) / 1000))} 秒再请求`
+        : result?.reason === "not-connected" ? "云端未连接，无法请求状态" : "状态请求未发送";
+    if (!result?.sent) safeLogger.info(`触摸屏幕请求完整状态未提交：${message}`);
+    Promise.resolve(plugin.showFlexbarSnackbarMessage?.(payload.serialNumber, message, level, "refresh", 1800))
+      .catch(() => safeLogger.warn("显示屏幕触摸反馈失败"));
+  });
+
   plugin.on("plugin.data", (payload) => {
     const key = payload?.data?.key;
     if (!key || key.cid !== KEY_CID) return;
-    if (key.cfg?.keyType === "directDraw") dashboards.set(payload.serialNumber, { key, busy: false });
+    // Direct Draw 触摸只由 device.touch 报告；不把它当作普通按键点击。
+    if (key.cfg?.keyType === "directDraw") {
+      dashboards.set(payload.serialNumber, { key, busy: false });
+      return;
+    }
     const identity = keyIdentity(payload.serialNumber, key.uid);
     const current = viewFor(identity);
     const next = nextView(current);
@@ -626,7 +661,10 @@ function createPluginRuntime({
         devices,
         devicesError,
         monitorBlockMessage: monitorBlockMessage(),
-        printer: { id: config.printerId, name: printer.printerName, state: printer.state, link: printer.status },
+        printer: {
+          id: config.printerId, name: printer.printerName, state: printer.state, link: printer.status,
+          capabilities: getPrinterCapabilities(devices.find((device) => device.id === config.printerId)?.model, printer.state),
+        },
         display: buildDisplayFor("progress"),
         views: Array.from(views.entries()).map(([identity, view]) => {
           const [serialNumber, uid] = JSON.parse(identity);

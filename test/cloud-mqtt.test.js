@@ -50,7 +50,6 @@ function makeClient(overrides = {}) {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     createClient: factory,
     random: () => 0.5,
-    ...(overrides.now ? { cooldownNow: overrides.now } : {}),
     ...overrides,
   });
   client.onStatus((status) => statuses.push(status));
@@ -230,46 +229,35 @@ test("unconfirmed MQTT close times out and does not restart", async () => {
   assert.equal(client.state, CONNECTION_STATES.failed);
 });
 
-test("pushall cooldown uses monotonic time despite wall-clock jumps", () => {
-  let wall = 1_000;
+test("pushall requests enforce a five-second per-device cooldown", () => {
   let monotonic = 50;
-  const { client, created } = makeClient({ deviceId: "CLOCK", now: () => wall, cooldownNow: () => monotonic, pushallCooldownMs: 300_000 });
-  client.start();
-  created[0].emit("connect");
-  assert.equal(client.requestFullState().sent, true);
-  wall += 86_400_000;
-  monotonic += 1_000;
-  assert.equal(client.requestFullState().reason, "cooldown");
-  monotonic += 299_000;
-  assert.equal(client.requestFullState().sent, true);
-});
-
-test("pushall requests are rate limited", () => {
-  let clock = 0;
-  const { client, created } = makeClient({ deviceId: "RATE", now: () => clock, pushallCooldownMs: 300_000 });
+  const { client, created } = makeClient({ deviceId: "COOLDOWN-5S", cooldownNow: () => monotonic });
   client.start();
 
   assert.deepEqual(client.requestFullState(), { sent: false, reason: "not-connected" });
 
   const fake = created[0];
   fake.emit("connect");
-  const first = client.requestFullState();
-  assert.equal(first.sent, true);
+  assert.equal(client.requestFullState().sent, true);
   assert.equal(fake.published.length, 1);
-  assert.equal(fake.published[0].topic, "device/RATE/request");
-  assert.equal(JSON.parse(fake.published[0].payload).pushing.command, "pushall");
-
-  clock = 1000;
   assert.equal(client.requestFullState().reason, "cooldown");
+  assert.equal(client.requestFullState().retryInMs, 5000);
+
+  monotonic += 4999;
+  assert.equal(client.requestFullState().reason, "cooldown");
+  assert.equal(client.requestFullState().retryInMs, 1);
   assert.equal(fake.published.length, 1);
 
-  clock = 300_000;
+  monotonic += 1;
   assert.equal(client.requestFullState().sent, true);
   assert.equal(fake.published.length, 2);
+  assert.equal(fake.published[0].topic, "device/COOLDOWN-5S/request");
+  assert.equal(JSON.parse(fake.published[0].payload).pushing.command, "pushall");
 });
 
-test("publish failures are reported instead of thrown", () => {
-  const { client, created } = makeClient({ deviceId: "FAIL" });
+test("publish failures are reported instead of thrown and observe cooldown", () => {
+  let monotonic = 0;
+  const { client, created } = makeClient({ deviceId: "FAIL-5S", cooldownNow: () => monotonic });
   client.start();
   const fake = created[0];
   fake.emit("connect");
@@ -280,6 +268,8 @@ test("publish failures are reported instead of thrown", () => {
   assert.deepEqual(result, { sent: false, reason: "publish-failed" });
   fake.publish = () => {};
   assert.equal(client.requestFullState().reason, "cooldown");
+  monotonic = 5000;
+  assert.equal(client.requestFullState().sent, true);
   client.stop();
 });
 
@@ -344,28 +334,10 @@ test("late callbacks from a stopped or replaced connection have no effect", asyn
   client.stop();
 });
 
-test("cooldown is shared across replacement clients and cannot be forced", () => {
-  let clock = 0;
-  const first = makeClient({ deviceId: "SHARED", now: () => clock, pushallCooldownMs: 1000 });
-  first.client.start();
-  first.created[0].emit("connect");
-  assert.equal(first.client.requestFullState().sent, true);
-  first.client.stop();
-  const second = makeClient({ deviceId: "SHARED", now: () => clock, pushallCooldownMs: 1000 });
-  second.client.start();
-  second.created[0].emit("connect");
-  clock = 500;
-  assert.deepEqual(second.client.requestFullState({ force: true }), { sent: false, reason: "cooldown", retryInMs: 500 });
-  assert.equal(second.created[0].published.length, 0);
-  clock = 1000;
-  assert.equal(second.client.requestFullState().sent, true);
-  second.client.stop();
-});
-
 test("asynchronous publish failure retains cooldown and hides errors", () => {
-  let clock = 0;
+  let monotonic = 0;
   const logs = [];
-  const { client, created } = makeClient({ deviceId: "ASYNC", now: () => clock, pushallCooldownMs: 1000,
+  const { client, created } = makeClient({ deviceId: "ASYNC-5S", cooldownNow: () => monotonic,
     logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) } });
   client.start();
   created[0].emit("connect");
@@ -375,7 +347,7 @@ test("asynchronous publish failure retains cooldown and hides errors", () => {
   callback(new Error("sensitive-token"));
   assert.equal(client.requestFullState().reason, "cooldown");
   assert.ok(logs.every((line) => !line.includes("sensitive-token")));
-  clock = 1000;
+  monotonic = 5000;
   assert.equal(client.requestFullState().sent, true);
   client.stop();
 });

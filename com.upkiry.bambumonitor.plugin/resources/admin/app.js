@@ -35,6 +35,10 @@
     statusFailures: 0,
     lastStatusAt: null,
     serviceUnavailable: false,
+    activeTab: "overview",
+    debugPaused: false,
+    debugFrames: [],
+    debugSignature: "",
   };
 
   const $ = (id) => document.getElementById(id);
@@ -360,6 +364,9 @@
     renderRegionSelect(data.regions, config.region, signedIn);
     renderBanner(data, signedIn, expired);
     renderDevices(data, signedIn);
+    renderInstrumentCards(data);
+    if (!signedIn && !state.initialTabSelected) selectTab("account");
+    state.initialTabSelected = true;
     renderSnapshot(data);
     renderLoginMode();
     setBusy(state.busy);
@@ -513,7 +520,7 @@
           ? "超过 5 分钟未收到设备报文；部分字段可能保留更早的数据。"
           : "最近报文时间不代表所有字段的更新时间；部分字段可能保留较早的数据。");
     renderHms(printerState.hms, fields.hms);
-    renderAms(printerState.ams, freshness.ams);
+    renderAms(printerState.ams, freshness.ams, printer.capabilities?.ams);
 
     const progress = $("progress-bar");
     if (progress) {
@@ -526,10 +533,80 @@
     }
   }
 
-  function renderAms(ams, freshness) {
+  function renderInstrumentCards(data) {
+    const available = data.auth?.state === "signed-in" && Boolean(data.config?.printerId);
+    const report = available ? data.printer?.state || {} : {};
+    const fields = report.freshness?.fields || {};
+    const sensors = available ? data.printer?.capabilities?.sensors || {} : {};
+    for (const key of ["nozzle", "bed", "chamber"]) setHidden(`sensor-${key}`, sensors[key] !== true);
+    for (const [key, capability] of Object.entries({ part: "fanPart", auxiliary: "fanAuxiliary", chamber: "fanChamber", heatbreak: "fanHeatbreak" })) {
+      setHidden(`sensor-fan-${key}`, sensors[capability] !== true);
+    }
+    setHidden("temperature-card", !["nozzle", "bed", "chamber"].some(key => sensors[key] === true));
+    setHidden("fan-card", !["fanPart", "fanAuxiliary", "fanChamber", "fanHeatbreak"].some(key => sensors[key] === true));
+    setText("hero-task", report.taskName ? withFreshness(report.taskName, fields.taskName) : "等待打印任务");
+    setText("hero-progress", withFreshness(formatPercent(report.progressPercent), fields.progressPercent));
+    setText("hero-state", withFreshness(labelForActivity(report.activity, report.rawActivity), fields.activity));
+    const chamber = report.chamber?.current;
+    setText("chamber-text", Number.isFinite(chamber)
+      ? withFreshness(`${Math.round(chamber)}℃`, fields["chamber.current"])
+      : "未知");
+    for (const key of ["part", "auxiliary", "chamber", "heatbreak"]) {
+      const value = report.fans?.[key];
+      const text = Number.isFinite(value) && value >= 0 && value <= 100 ? `${Math.round(value)}%` : "未知";
+      setText(`fan-${key}`, value == null ? text : withFreshness(text, fields[`fans.${key}`]));
+    }
+  }
+
+  const TAB_NAMES = ["overview", "account", "diagnostics", "debug"];
+  function selectTab(name) {
+    if (!TAB_NAMES.includes(name)) return;
+    state.activeTab = name;
+    for (const key of TAB_NAMES) {
+      setHidden(`panel-${key}`, key !== name);
+      const tab = $(`tab-${key}`);
+      if (tab) {
+        tab.setAttribute("aria-selected", String(key === name));
+        tab.tabIndex = key === name ? 0 : -1;
+      }
+    }
+    if (name === "debug") renderDebugFrames();
+  }
+
+  function renderDebugFrames() {
+    const list = $("debug-frames");
+    if (!list || state.activeTab !== "debug") return;
+    const protocol = $("debug-protocol")?.value || "all";
+    const query = ($("debug-search")?.value || "").trim().toLowerCase();
+    const frames = state.debugFrames.filter(frame => (protocol === "all" || frame.protocol === protocol) &&
+      (!query || JSON.stringify(frame).toLowerCase().includes(query)));
+    const signature = JSON.stringify([frames, protocol, query]);
+    setText("debug-count", `${state.debugPaused ? "显示已暂停 · " : ""}${frames.length} / ${state.debugFrames.length} 条记录`);
+    setHidden("debug-empty", frames.length > 0);
+    setText("debug-empty", state.debugFrames.length ? "没有匹配的记录。" : "尚未收到数据，请登录并连接设备，或刷新设备列表。");
+    if (signature === state.debugSignature) return;
+    state.debugSignature = signature;
+    const opened = new Set(Array.from(list.children).filter(node => node.open).map(node => node.dataset.id));
+    clear(list);
+    for (const frame of frames) {
+      const item = create("details", "debug-frame");
+      item.dataset.id = String(frame.id);
+      item.open = opened.has(String(frame.id));
+      const summary = create("summary");
+      summary.appendChild(create("span", "", formatDateTime(frame.at)));
+      summary.appendChild(create("span", "badge", String(frame.protocol || "unknown").toUpperCase()));
+      summary.appendChild(create("span", "", `${frame.source || "—"}${frame.truncated ? " · 数据已截断" : ""}`));
+      item.appendChild(summary);
+      item.appendChild(create("pre", "", JSON.stringify(frame, null, 2)));
+      list.appendChild(item);
+    }
+  }
+
+  function renderAms(ams, freshness, capabilities = {}) {
     const list = $("ams-list");
     clear(list);
     const units = Array.isArray(ams?.units) ? ams.units : null;
+    setHidden("ams-section", !units?.length);
     setText("ams-empty", units === null ? (ams && Object.hasOwn(ams, "units") ? "AMS 列表未知" : "尚无 AMS 数据") : units.length ? "" : "已上报空 AMS 列表");
     if (!list || !ams) return;
     if (ams.rawStatus !== null && ams.rawStatus !== undefined) {
@@ -540,17 +617,37 @@
     }
     for (const unit of units || []) {
       if (!unit || typeof unit !== "object") continue;
+      const capability = capabilities[unit.id] || {};
+      const unitLabel = capability.type && capability.type !== "unknown"
+        ? `${capability.label} ${unit.id ?? "未知"}` : `AMS ${unit.id ?? "未知"}（类型未知）`;
+      // AMS 3H 按分区上报，不能把分区读数合并成一个整箱温湿度。
+      for (const zone of Array.isArray(unit.zones) ? unit.zones : []) {
+        if (!zone || typeof zone !== "object") continue;
+        const supported = capability.zones?.[zone.id] || {};
+        const marks = freshness?.units?.[unit.id]?.zones?.[zone.id] || {};
+        const values = [];
+        if (supported.temperature === true && Number.isFinite(zone.temperature)) {
+          values.push(`温度：${withFreshness(`${Math.round(zone.temperature)}℃`, marks.temperature)}`);
+        }
+        if (supported.humidity === true && Number.isFinite(zone.humidity)) {
+          values.push(`湿度：${withFreshness(`${zone.humidity}%`, marks.humidity)}`);
+        }
+        if (supported.dryingMinutes === true && Number.isFinite(zone.dryingMinutes)) {
+          values.push(`烘干剩余：${withFreshness(formatMinutes(zone.dryingMinutes), marks.dryingMinutes)}`);
+        }
+        if (values.length) list.appendChild(create("li", "status-item", `${unitLabel} · 分区 ${Number(zone.id) + 1} · ${values.join(" · ")}`));
+      }
       const slots = Array.isArray(unit.slots) ? unit.slots : null;
       if (!slots) {
-        list.appendChild(create("li", "status-item", `AMS ${unit.id ?? "未知"}：暂无槽位数据，槽位信息未知`));
+        list.appendChild(create("li", "status-item", `${unitLabel}：暂无槽位数据，槽位信息未知`));
         continue;
       }
-      if (!slots.length) list.appendChild(create("li", "status-item", `AMS ${unit.id ?? "未知"}：已上报空槽位列表`));
+      if (!slots.length) list.appendChild(create("li", "status-item", `${unitLabel}：已上报空槽位列表`));
       for (const slot of slots) {
         if (!slot || typeof slot !== "object") continue;
         const item = create("li", "status-item");
         const exists = slot.exists === true ? "存在" : slot.exists === false ? "空槽" : "未知";
-        const label = `AMS ${unit.id ?? "未知"} · 槽位 ${slot.id ?? "未知"}`;
+        const label = `${unitLabel} · 槽位 ${slot.id ?? "未知"}`;
         const slotFreshness = freshness?.units?.[unit.id]?.slots?.[slot.id] || {};
         // 仅凭仍然新鲜的空槽观察隐藏旧耗材；过期或未知观察不应遮住新报告的字段。
         const observedAt = slotFreshness.exists?.at;
@@ -573,7 +670,7 @@
         const remaining = Number.isFinite(slot.remaining) && slot.remaining >= 0 && slot.remaining <= 100 ? `${slot.remaining}%` : "未知";
         const rawState = slot.rawState === null || slot.rawState === undefined || slot.rawState === "" ? "未知" : String(slot.rawState);
         const currentLabel = active ? `（${withFreshness("当前", freshness?.fields?.current)}）` : "";
-        item.appendChild(create("span", "", `${label}${currentLabel} · 耗材：${withFreshness(exists, slotFreshness.exists)} · 材质：${withFreshness(slot.material || "未知", slotFreshness.material)} · 颜色：${withFreshness(color ? `#${color}` : "未知", slotFreshness.color)} · 余量：${withFreshness(remaining, slotFreshness.remaining)} · 状态原始值：${withFreshness(rawState, slotFreshness.rawState)}`));
+        item.appendChild(create("span", "", `${label}${currentLabel} · 耗材：${withFreshness(exists, slotFreshness.exists)} · 材质：${withFreshness(slot.material || "未知", slotFreshness.material)} · 颜色：${withFreshness(color ? `#${color}` : "未知", slotFreshness.color)}${capability.remaining === true ? ` · 余量：${withFreshness(remaining, slotFreshness.remaining)}` : ""} · 状态原始值：${withFreshness(rawState, slotFreshness.rawState)}`));
         list.appendChild(item);
       }
     }
@@ -613,6 +710,8 @@
   }
 
   function renderDiagnostics(data) {
+    if (!state.debugPaused) state.debugFrames = Array.isArray(data.frames) ? data.frames : [];
+    renderDebugFrames();
     const requests = Array.isArray(data.requests) ? data.requests : [];
     const tbody = $("requests-body");
     if (tbody) {
@@ -676,8 +775,8 @@
     if (action === "requestFullState" && typeof result?.sent === "boolean") {
       if (result.sent) showMessage("完整状态请求已提交，等待设备上报。", "success");
       else if (result.reason === "cooldown") {
-        const seconds = Number.isFinite(result.retryInMs) ? Math.max(1, Math.ceil(result.retryInMs / 1000)) : null;
-        showMessage(seconds ? `请求过于频繁，请在 ${seconds} 秒后重试。` : "请求过于频繁，请稍后重试。", "warning");
+        const seconds = Number.isFinite(result.retryInMs) ? Math.max(1, Math.ceil(result.retryInMs / 1000)) : 5;
+        showMessage(`请求过于频繁，请在 ${seconds} 秒后重试。`, "warning");
       } else if (result.reason === "not-connected") showMessage("当前未连接云端，无法请求完整状态。", "warning");
       else showMessage("完整状态请求发送失败，请稍后重试。", "error");
       return;
@@ -897,6 +996,7 @@
           remainingMinutes: number(report.remainingMinutes),
           nozzle: sensor(report.nozzle),
           bed: sensor(report.bed),
+          chamber: { current: number(report.chamber?.current) },
         },
       },
       diagnostics: {
@@ -1062,6 +1162,30 @@
   }
 
   function bindEvents() {
+    for (const [index, name] of TAB_NAMES.entries()) {
+      const tab = $(`tab-${name}`);
+      tab.addEventListener("click", () => selectTab(name));
+      tab.addEventListener("keydown", event => {
+        let next;
+        if (event.key === "ArrowRight") next = (index + 1) % TAB_NAMES.length;
+        if (event.key === "ArrowLeft") next = (index + TAB_NAMES.length - 1) % TAB_NAMES.length;
+        if (event.key === "Home") next = 0;
+        if (event.key === "End") next = TAB_NAMES.length - 1;
+        if (next === undefined) return;
+        event.preventDefault();
+        selectTab(TAB_NAMES[next]);
+        $(`tab-${TAB_NAMES[next]}`).focus();
+      });
+    }
+    $("debug-protocol").addEventListener("change", renderDebugFrames);
+    $("debug-search").addEventListener("input", renderDebugFrames);
+    $("debug-pause").addEventListener("click", () => {
+      state.debugPaused = !state.debugPaused;
+      $("debug-pause").setAttribute("aria-pressed", String(state.debugPaused));
+      setText("debug-pause", state.debugPaused ? "继续显示" : "暂停显示");
+      if (!state.debugPaused) state.debugFrames = state.diagnostics?.frames || [];
+      renderDebugFrames();
+    });
     $("manual-token-form").addEventListener("submit", (event) => {
       event.preventDefault();
       const input = $("manual-token");

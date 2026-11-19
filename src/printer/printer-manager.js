@@ -12,6 +12,7 @@ const { reduceReport, reduceConnection, resetForPrinter } = require("./state-red
 function createPrinterManager({
   createMqttClient = createCloudMqttClient,
   logger,
+  onFrame,
   now = () => Date.now(),
   closeTimeoutMs = 6_000,
 } = {}) {
@@ -117,6 +118,15 @@ function createPrinterManager({
         deviceId: selectedId,
         logger,
         now,
+        onFrame: (event) => {
+          if (generation !== myGeneration || printerId !== selectedId) return;
+          try {
+            const result = onFrame?.(event);
+            if (result && typeof result.catch === "function") result.catch(() => {});
+          } catch {
+            // Diagnostics must not affect printer state.
+          }
+        },
       });
       client = next;
 
@@ -129,9 +139,9 @@ function createPrinterManager({
         notify({ type: "state", state, status });
       });
 
-      next.onReport(({ raw, receivedAt }) => {
+      next.onReport(({ raw, amsIdentities, receivedAt }) => {
         if (client !== next || generation !== myGeneration) return;
-        const { state: merged, taskSwitched, reason } = reduceReport(state, raw, { receivedAt });
+        const { state: merged, taskSwitched, reason } = reduceReport(state, raw, { receivedAt, amsIdentities });
         state = merged;
         notify({ type: "report", state, taskSwitched, reason });
       });

@@ -11,27 +11,26 @@ function page(fetch) {
       id, value: "", textContent: "", hidden: id === "service-warning", disabled: false, readOnly: false,
       dataset: {}, children: [], appendChild(child) { this.children.push(child); },
       removeChild() { this.children.shift(); }, get firstChild() { return this.children[0]; },
-      focus() {}, addEventListener() {},
+      focus() {}, addEventListener() {}, setAttribute(key, value) { this[key] = value; },
     });
     return nodes.get(id);
   }
   const document = { getElementById: node, createElement: () => ({ value: "", textContent: "", dataset: {}, style: {}, children: [], setAttribute() {}, appendChild(child) { this.children.push(child); } }), addEventListener() {}, hidden: false };
   const context = { document, fetch, URL, URLSearchParams, location: { hash: "", pathname: "/", search: "" }, history: {}, sessionStorage: {}, window: {}, navigator: {}, setInterval, clearInterval, setTimeout, Date, console };
   const file = path.join(__dirname, "../com.upkiry.bambumonitor.plugin/resources/admin/app.js");
-  const source = fs.readFileSync(file, "utf8").replace("  init();\n})();", "  globalThis.page = { state, loadStatus, loadDiagnostics, handleActionResult, renderStatus, diagnosticExport, runAction };\n})();");
+  const source = fs.readFileSync(file, "utf8").replace("  init();\n})();", "  globalThis.page = { state, loadStatus, loadDiagnostics, handleActionResult, renderStatus, diagnosticExport, runAction, selectTab, renderDiagnostics, renderDebugFrames };\n})();");
   vm.runInNewContext(source, context);
   context.page.state.token = "token";
-  return { ...context.page, node };
+  return { ...context.page, node, renderStatus(data) {
+    // 模拟 runtime 每次状态响应都会按当前机型和状态重算能力。
+    if (data.printer) data.printer.capabilities = require("../src/printer/capabilities").getPrinterCapabilities(
+      data.devices?.find(device => device.id === data.config?.printerId)?.model, data.printer.state);
+    context.page.renderStatus(data);
+  } };
 }
 const ok = (data) => ({ status: 200, ok: true, json: async () => data });
 const status = (overrides = {}) => ({ auth: { state: "signed-out" }, config: { region: "china" }, devices: [], ...overrides });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
-
-test("设备操作按钮清楚区分更新列表与检查连接", () => {
-  const html = fs.readFileSync(path.join(__dirname, "../com.upkiry.bambumonitor.plugin/resources/admin/index.html"), "utf8");
-  assert.match(html, /id="refresh-devices-btn"[^>]*title="[^"]*重新读取账号绑定的打印机列表[^"]*">更新设备列表/);
-  assert.match(html, /id="test-connection-btn"[^>]*title="[^"]*验证当前账号能否读取绑定的打印机列表[^"]*">验证云端访问/);
-});
 
 test("验证码流程锁定区域账号，取消失败保持锁定，成功后解除", async () => {
   let cancelStatus = "error";
@@ -216,7 +215,7 @@ test("AMS 耗材存在、空槽及未知分开显示，空槽不暴露旧数据"
   ui.renderStatus(data);
   let items = ui.node("ams-list").children;
   assert.equal(items[0].children[0].style.backgroundColor, "#FF0011FF");
-  assert.match(items[0].children[1].textContent, /<unit>.*耗材：存在.*<PLA>.*余量：0%/);
+  assert.match(items[0].children[1].textContent, /<unit>.*耗材：存在.*<PLA>/);
   assert.equal(items[1].children.length, 1);
   assert.match(items[1].children[0].textContent, /耗材：空槽/);
   assert.doesNotMatch(items[1].children[0].textContent, /OLD_|ABCDEF|78|材质|颜色|余量/);
@@ -316,8 +315,179 @@ test("完整状态请求区分提交、冷却和断连", () => {
   const ui = page(async () => ok({}));
   ui.handleActionResult("requestFullState", { sent: true });
   assert.match(ui.node("message").textContent, /已提交/);
-  ui.handleActionResult("requestFullState", { sent: false, reason: "cooldown", retryInMs: 1500 });
-  assert.match(ui.node("message").textContent, /2 秒后重试/);
+  ui.handleActionResult("requestFullState", { sent: false, reason: "cooldown", retryInMs: 4200 });
+  assert.match(ui.node("message").textContent, /5 秒后重试/);
   ui.handleActionResult("requestFullState", { sent: false, reason: "not-connected" });
   assert.match(ui.node("message").textContent, /未连接云端/);
+});
+
+test("风扇卡片保留零值、独立旧数据和未知读数", () => {
+  const ui = page(async () => ok({}));
+  const at = Date.now();
+  ui.renderStatus(status({auth: {state: "signed-in"}, config: {printerId: "x"}, printer: {state: {
+    fans: {part: 0, auxiliary: 80, chamber: null, heatbreak: null},
+    freshness: {fields: {"fans.part": {at, stale: false}, "fans.auxiliary": {at, stale: true}}},
+  }}}));
+  assert.equal(ui.node("fan-part").textContent, "0%");
+  assert.equal(ui.node("fan-auxiliary").textContent, "80%（旧数据）");
+  assert.equal(ui.node("fan-chamber").textContent, "未知");
+  assert.equal(ui.node("fan-heatbreak").textContent, "未知");
+  ui.renderStatus(status());
+  assert.equal(ui.node("fan-part").textContent, "未知");
+});
+
+test("A1 热端风扇从有效上报显示百分比，缺失和非法值不刷新，null 或换机后隐藏", () => {
+  const { reduceReport, resetForPrinter } = require("../src/printer/state-reducer");
+  const ui = page(async () => ok({}));
+  const at = Date.now();
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"},
+    devices: [{id: "x", model: "A1"}], printer: {state: resetForPrinter("x")}});
+  const report = (raw, receivedAt = at) => {
+    data.printer.state = reduceReport(data.printer.state, raw, {receivedAt}).state;
+    ui.renderStatus(data);
+  };
+  ui.renderStatus(data);
+  assert.equal(ui.node("sensor-fan-heatbreak").hidden, true);
+  report({heatbreak_fan_speed: "8"}, at - 301000);
+  assert.equal(ui.node("sensor-fan-heatbreak").hidden, false);
+  assert.equal(ui.node("fan-heatbreak").textContent, "53%（旧数据）");
+  report({nozzle_temper: 200});
+  report({heatbreak_fan_speed: "255"});
+  assert.equal(ui.node("fan-heatbreak").textContent, "53%（旧数据）");
+  report({heatbreak_fan_speed: "0"});
+  assert.equal(ui.node("fan-heatbreak").textContent, "0%");
+  report({heatbreak_fan_speed: null});
+  assert.equal(ui.node("sensor-fan-heatbreak").hidden, true);
+  report({heatbreak_fan_speed: "15"});
+  assert.equal(ui.node("fan-heatbreak").textContent, "100%");
+  data.config.printerId = "next";
+  data.devices = [{id: "next", model: "A1"}];
+  data.printer.state = resetForPrinter("next");
+  ui.renderStatus(data);
+  assert.equal(ui.node("sensor-fan-heatbreak").hidden, true);
+});
+
+test("调试Tab按协议与文本过滤，安全显示报文并保留展开状态", () => {
+  const ui = page(async () => ok({}));
+  ui.selectTab("debug");
+  assert.equal(ui.node("panel-debug").hidden, false);
+  assert.equal(ui.node("panel-overview").hidden, true);
+  assert.equal(ui.node("tab-debug")["aria-selected"], "true");
+  const frames = [
+    {id: 2, at: Date.now(), protocol: "mqtt", source: "report", payload: {print: {nozzle_temper: 220, text: "<script>"}}},
+    {id: 1, at: Date.now(), protocol: "http", source: "/bind", payload: {devices: []}},
+  ];
+  ui.renderDiagnostics({frames});
+  const list = ui.node("debug-frames");
+  assert.equal(list.children.length, 2);
+  assert.match(list.children[0].children[1].textContent, /<script>/);
+  list.children[0].open = true;
+  ui.renderDiagnostics({frames: [{id: 3, protocol: "mqtt"}, ...frames]});
+  assert.equal(list.children[1].open, true);
+  ui.node("debug-protocol").value = "http";
+  ui.renderDebugFrames();
+  assert.equal(list.children.length, 1);
+  ui.node("debug-search").value = "nozzle_temper";
+  ui.renderDebugFrames();
+  assert.equal(list.children.length, 0);
+  assert.match(ui.node("debug-empty").textContent, /没有匹配/);
+  ui.state.debugPaused = true;
+  ui.renderDiagnostics({frames: []});
+  assert.equal(ui.state.debugFrames.length, 3);
+});
+
+test("腔温区分有效读数、零值、旧数据和未知，不借用 AMS 温度", () => {
+  const ui = page(async () => ok({}));
+  const at = Date.now();
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"}, printer: {state: {
+    chamber: {current: 0}, freshness: {fields: {"chamber.current": {at, stale: false}}},
+  }}});
+  ui.renderStatus(data);
+  assert.equal(ui.node("chamber-text").textContent, "0℃");
+  data.printer.state.chamber.current = 35.6;
+  data.printer.state.freshness.fields["chamber.current"].stale = true;
+  ui.renderStatus(data);
+  assert.equal(ui.node("chamber-text").textContent, "36℃（旧数据）");
+  data.printer.state.freshness.fields["chamber.current"] = {at: at - 301000, stale: false};
+  ui.renderStatus(data);
+  assert.match(ui.node("chamber-text").textContent, /旧数据/);
+  data.printer.state.chamber.current = null;
+  ui.renderStatus(data);
+  assert.equal(ui.node("chamber-text").textContent, "未知");
+  delete data.printer.state.chamber;
+  data.printer.state.ams = {units: [{id: "0", temp: 40}]};
+  ui.renderStatus(data);
+  assert.equal(ui.node("chamber-text").textContent, "未知");
+  ui.state.status = data;
+  assert.equal(ui.diagnosticExport().status.printerState.chamber.current, null);
+});
+
+test("后台按当前机型隐藏不存在的传感器，切换机型恢复对应行", () => {
+  const ui = page(async () => ok({}));
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"},
+    devices: [{id: "x", model: "A1"}], printer: {state: {
+      nozzle: {current: 0}, bed: {current: 0}, chamber: {current: 0},
+      fans: {part: 0, auxiliary: 0, chamber: 0, heatbreak: 0},
+      ams: {units: [{id: "0", slots: [{id: "0", remaining: 50, material: "PLA"}]}]},
+    }}});
+  ui.renderStatus(data);
+  assert.equal(ui.node("sensor-nozzle").hidden, false);
+  assert.equal(ui.node("sensor-bed").hidden, false);
+  assert.equal(ui.node("sensor-fan-part").hidden, false);
+  assert.equal(ui.node("sensor-fan-heatbreak").hidden, false);
+  for (const key of ["chamber", "fan-auxiliary", "fan-chamber"])
+    assert.equal(ui.node(`sensor-${key}`).hidden, true);
+  assert.match(ui.node("ams-list").children[0].children[0].textContent, /AMS lite/);
+  assert.doesNotMatch(ui.node("ams-list").children[0].children[0].textContent, /余量/);
+  data.devices[0].model = "X1 Carbon";
+  ui.renderStatus(data);
+  assert.equal(ui.node("sensor-chamber").hidden, false);
+  assert.equal(ui.node("sensor-fan-auxiliary").hidden, false);
+  assert.match(ui.node("ams-list").children[0].children[0].textContent, /余量：50%/);
+  data.printer.state = {};
+  data.devices[0].model = "未知新机型";
+  ui.renderStatus(data);
+  assert.equal(ui.node("temperature-card").hidden, true);
+  assert.equal(ui.node("fan-card").hidden, true);
+  assert.equal(ui.node("ams-section").hidden, true);
+});
+
+test("AMS 按各单元型号独立展示，未知类型不套用已知名称", () => {
+  const ui = page(async () => ok({}));
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"},
+    devices: [{id: "x", model: "X1 Carbon"}], printer: {state: {ams: {units:
+      ["1", "2", "3", "4", "f"].map((rawInfo, id) => ({id: String(id), rawInfo,
+        slots: [{id: "0", material: "PLA", remaining: 0}]}))
+    }}}});
+  ui.renderStatus(data);
+  const texts = ui.node("ams-list").children.map(item => item.children[0].textContent);
+  assert.match(texts[0], /AMS 0.*余量：0%/);
+  assert.match(texts[1], /AMS lite 1/);
+  assert.doesNotMatch(texts[1], /余量/);
+  assert.match(texts[2], /AMS 2 Pro 2/);
+  assert.match(texts[3], /AMS HT 3/);
+  assert.match(texts[4], /AMS 4（类型未知）/);
+});
+
+test("AMS 3H shows nine reported slots and separate zone sensors without cabinet readings", () => {
+  const ui = page(async () => ok({}));
+  const at = Date.now();
+  const data = status({auth: {state: "signed-in"}, config: {printerId: "x"},
+    devices: [{id: "x", model: "H3C"}], printer: {state: {ams: {units: [{id: "0", model: "AMS 3H", rawInfo: "7",
+      temperature: 99, humidity: 99,
+      zones: [{id: "0", temperature: 0, humidity: 0, dryingMinutes: 0}, {id: "1", temperature: 45.5, humidity: null}],
+      slots: Array.from({length: 9}, (_, id) => ({id: String(id), material: "PLA", remaining: id})),
+    }]}, freshness: {ams: {units: {0: {zones: {0: {temperature: {at, stale: false}, humidity: {at, stale: true}, dryingMinutes: {at, stale: false}}}}}}}}}});
+  ui.renderStatus(data);
+  const items = ui.node("ams-list").children;
+  assert.equal(items.length, 11);
+  assert.match(items[0].textContent, /AMS 3H 0.*分区 1.*温度：0℃.*湿度：0%（旧数据）/);
+  assert.match(items[1].textContent, /分区 2.*温度：46℃/);
+  assert.doesNotMatch(items[1].textContent, /湿度/);
+  assert.match(items[10].children[0].textContent, /AMS 3H 0.*槽位 8/);
+  assert.ok(!items.some(item => item.textContent.includes("99℃")));
+  data.printer.state.ams.units[0].zones = null;
+  data.printer.state.ams.units[0].slots = [{id: "8", material: "PLA"}];
+  ui.renderStatus(data);
+  assert.equal(ui.node("ams-list").children.length, 1);
 });

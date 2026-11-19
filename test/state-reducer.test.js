@@ -421,8 +421,119 @@ test("AMS state and tracking have matching bounded unit and slot counts", () => 
   assert.equal(Object.keys(state.freshness.ams.units["0"].slots).length, 16);
 });
 
+test("fan deltas preserve missing channels, zero, null and earlier snapshots", () => {
+  const first = reduceReport(null, {
+    cooling_fan_speed: "15", big_fan1_speed: "6", big_fan2_speed: "3", heatbreak_fan_speed: "8",
+    nozzle_temper: 200, task_id: "1",
+  }, { receivedAt: 100 }).state;
+  const before = JSON.stringify(first);
+  const second = reduceReport(first, { cooling_fan_speed: "0", nozzle_temper: 0 }, { receivedAt: 200 }).state;
+  assert.deepEqual(second.fans, { part: 0, auxiliary: 40, chamber: 20, heatbreak: 53 });
+  assert.deepEqual(second.rawFans, { part: "0", auxiliary: "6", chamber: "3", heatbreak: "8" });
+  assert.deepEqual(second.freshness.fields["fans.part"], { at: 200, stale: false });
+  assert.deepEqual(second.freshness.fields["fans.auxiliary"], { at: 100, stale: false });
+  assert.deepEqual(second.freshness.fields["fans.heatbreak"], { at: 100, stale: false });
+  assert.deepEqual(second.freshness.fields["rawFans.heatbreak"], { at: 100, stale: false });
+  const cleared = reduceReport(second, { cooling_fan_speed: null, heatbreak_fan_speed: null }, { receivedAt: 300 }).state;
+  assert.equal(cleared.fans.part, null);
+  assert.equal(cleared.fans.heatbreak, null);
+  assert.equal(cleared.rawFans.part, null);
+  assert.equal(cleared.fans.auxiliary, 40);
+  assert.deepEqual(cleared.freshness.fields["fans.part"], { at: 300, stale: false });
+  assert.deepEqual(cleared.freshness.fields["fans.heatbreak"], { at: 300, stale: false });
+  const switched = reduceReport(second, { task_id: "2" }).state;
+  assert.deepEqual(switched.fans, second.fans);
+  assert.equal(JSON.stringify(first), before);
+  const reset = resetForPrinter("another");
+  assert.deepEqual(reset.fans, { part: null, auxiliary: null, chamber: null, heatbreak: null });
+  assert.deepEqual(reset.rawFans, reset.fans);
+  assert.deepEqual(reset.freshness.fields, {});
+});
+
+test("fan freshness follows temperature across reconnect, invalid encodings and expiration", () => {
+  const { fieldIsFresh } = require("../src/display/presenter");
+  const first = reduceReport(null, {
+    cooling_fan_speed: "15", big_fan1_speed: "6", big_fan2_speed: "3", heatbreak_fan_speed: "10", nozzle_temper: 200,
+  }, { receivedAt: 1000 }).state;
+  for (const now of [999, 1000, 300999, 301000]) {
+    assert.equal(fieldIsFresh(first, "fans.part", now), fieldIsFresh(first, "nozzle.current", now));
+    assert.equal(fieldIsFresh(first, "fans.heatbreak", now), fieldIsFresh(first, "nozzle.current", now));
+  }
+  assert.equal(fieldIsFresh(first, "fans.part", 300999), true);
+  assert.equal(fieldIsFresh(first, "fans.part", 301000), false);
+  let state = reduceConnection(first, "disconnected");
+  assert.deepEqual(state.fans, first.fans);
+  for (const fan of ["part", "auxiliary", "chamber", "heatbreak"]) assert.equal(state.freshness.fields[`fans.${fan}`].stale, true);
+  state = reduceConnection(state, "connected");
+  state = reduceReport(state, { cooling_fan_speed: "255", heatbreak_fan_speed: "255", nozzle_temper: "bad" }, { receivedAt: 2000 }).state;
+  assert.equal(state.rawFans.part, "255");
+  assert.equal(state.rawFans.heatbreak, "255");
+  assert.equal(state.fans.heatbreak, 66);
+  assert.deepEqual(state.freshness.fields["fans.heatbreak"], { at: 1000, stale: true });
+  assert.equal(state.fans.part, 100); // 与温度一致，非法值不替换旧观测，也不刷新有效值时间。
+  assert.deepEqual(state.freshness.fields["fans.part"], { at: 1000, stale: true });
+  assert.deepEqual(state.freshness.fields["nozzle.current"], { at: 1000, stale: true });
+  assert.deepEqual(state.freshness.fields["rawFans.part"], { at: 2000, stale: false });
+  state = reduceReport(state, { cooling_fan_speed: "0" }, { receivedAt: 3000 }).state;
+  assert.equal(state.fans.part, 0);
+  assert.deepEqual(state.freshness.fields["fans.part"], { at: 3000, stale: false });
+  assert.deepEqual(state.freshness.fields["fans.chamber"], { at: 1000, stale: true });
+  assert.deepEqual(first.freshness.fields["fans.part"], { at: 1000, stale: false });
+});
+
 test("arrays are not deep merged", () => {
   const first = reduceReport(null, { hms: [{ code: "1", attr: "2", module: "3" }] }).state;
   const second = reduceReport(first, { hms: [] }).state;
   assert.deepEqual(second.hms, []);
+});
+
+
+test("chamber increments retain independent freshness across reconnect and device switches", () => {
+  const first = reduceReport(null, {chamber_temper: 31.5, nozzle_temper: 220}, {receivedAt: 1000}).state;
+  const previous = JSON.stringify(first);
+  const second = reduceReport(first, {nozzle_temper: 221}, {receivedAt: 2000}).state;
+  assert.equal(JSON.stringify(first), previous);
+  assert.equal(second.chamber.current, 31.5);
+  assert.deepEqual(second.freshness.fields["chamber.current"], {at: 1000, stale: false});
+  const disconnected = reduceConnection(second, "disconnected");
+  const connected = reduceConnection(disconnected, "connected");
+  const partial = reduceReport(connected, {nozzle_temper: 222}, {receivedAt: 3000}).state;
+  assert.equal(partial.freshness.fields["chamber.current"].stale, true);
+  const invalid = reduceReport(partial, {chamber_temper: "bad"}, {receivedAt: 4000}).state;
+  assert.equal(invalid.chamber.current, 31.5);
+  assert.equal(invalid.freshness.fields["chamber.current"].at, 1000);
+  const zero = reduceReport(invalid, {chamber_temper: 0}, {receivedAt: 5000}).state;
+  assert.equal(zero.chamber.current, 0);
+  assert.deepEqual(zero.freshness.fields["chamber.current"], {at: 5000, stale: false});
+  const cleared = reduceReport(zero, {chamber_temper: null}, {receivedAt: 6000}).state;
+  assert.equal(cleared.chamber.current, null);
+  assert.equal(zero.chamber.current, 0);
+  assert.equal(resetForPrinter("next").chamber.current, null);
+});
+
+test("AMS rawInfo merges independently of slots and tracks its own freshness", () => {
+  const report = (info, tray) => ({ ams: { ams: [{ id: "0", info, tray }] } });
+  const first = reduceReport(null, report("101", [{ id: "0", remain: 20 }]), { receivedAt: 100 }).state;
+  const before = structuredClone(first);
+  assert.equal(first.ams.units[0].rawInfo, "101");
+  assert.deepEqual(first.freshness.ams.units[0].rawInfo, { at: 100, stale: false });
+  const absent = reduceReport(first, { ams: { ams: [{ id: "0", tray: null }] } }, { receivedAt: 200 }).state;
+  assert.equal(absent.ams.units[0].rawInfo, "101");
+  assert.deepEqual(absent.freshness.ams.units[0], { slots: {}, rawInfo: { at: 100, stale: false } });
+  const changed = reduceReport(absent, report("102", null), { receivedAt: 300 }).state;
+  assert.equal(changed.ams.units[0].rawInfo, "102");
+  assert.equal(changed.ams.units[0].slots, null);
+  assert.deepEqual(changed.freshness.ams.units[0].rawInfo, { at: 300, stale: false });
+  const stale = reduceConnection(changed, "disconnected");
+  assert.equal(stale.freshness.ams.units[0].rawInfo.stale, true);
+  const invalid = reduceReport(stale, report("bad-info", []), { receivedAt: 400 }).state;
+  assert.equal(invalid.ams.units[0].rawInfo, "102");
+  assert.deepEqual(invalid.freshness.ams.units[0].rawInfo, { at: 300, stale: true });
+  const cleared = reduceReport(invalid, report(null, null), { receivedAt: 500 }).state;
+  assert.equal(cleared.ams.units[0].rawInfo, null);
+  assert.deepEqual(cleared.freshness.ams.units[0].rawInfo, { at: 500, stale: false });
+  assert.deepEqual(first, before);
+  const unitsCleared = reduceReport(cleared, { ams: { ams: null } }).state;
+  assert.deepEqual(unitsCleared.freshness.ams.units, {});
+  assert.equal(resetForPrinter("next").ams, null);
 });

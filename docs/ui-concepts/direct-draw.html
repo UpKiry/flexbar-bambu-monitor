@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flexbar · Direct Draw 视觉提案</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111315;color:#e8e9e7;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}main{max-width:1664px;margin:auto;padding:56px 48px}header{display:flex;justify-content:space-between;align-items:end;gap:30px;margin-bottom:34px}.eyebrow{font:11px ui-monospace,monospace;letter-spacing:3px;color:#8e9a91;margin-bottom:14px}h1{font-size:32px;font-weight:550;letter-spacing:-1px;margin:0 0 12px}p{margin:0;color:#939b98;font-size:13px;line-height:1.8}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}label{font-size:12px;color:#a8b0aa}select,button{font:12px inherit;background:#24292a;color:#e6ebe7;border:1px solid #424a47;border-radius:8px;padding:9px 13px;cursor:pointer}select:focus-visible,button:focus-visible{outline:2px solid #a6edbc;outline-offset:3px}.note{display:flex;justify-content:space-between;padding:14px 0 18px;border-top:1px solid #303634;color:#89938e;font-size:11px;letter-spacing:.5px}article{padding:25px 0 27px;border-top:1px solid #303634}.title{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:17px}.name{display:flex;align-items:baseline;gap:15px}.num{font:12px ui-monospace,monospace;color:#77827b}h2{font-size:18px;font-weight:500;margin:0}.description{font-size:12px;color:#8d9791}.device{background:linear-gradient(#363a3c,#171a1c);padding:9px 14px;border:1px solid #44494a;border-radius:13px;box-shadow:0 8px 20px #0004}.screen{overflow:hidden;border-radius:4px;background:black}.screen canvas{display:block;width:100%;height:auto}.detail{display:flex;gap:20px;align-items:center;margin-top:16px}.detail-label{flex:0 0 115px;font-size:11px;color:#76837b;line-height:1.8}.detail canvas{width:min(100%,920px);height:auto;display:block}.detail-window{overflow:auto;max-width:100%}.foot{border-top:1px solid #303634;padding-top:22px;display:flex;justify-content:space-between;color:#7f8983;font-size:11px;line-height:1.8}.native .screen{overflow-x:auto}.native .screen canvas{width:2170px;height:60px;max-width:none}.native .detail{display:none}footer a{color:#c7d9cc}@media(max-width:800px){main{padding:30px 18px}header{display:block}.controls{margin-top:22px}.title{display:block}.description{margin-top:8px}.detail{display:block}.detail-label{margin-bottom:6px}.detail canvas{width:920px;max-width:none}.note{line-height:1.8;gap:20px}h1{font-size:26px}}
+</style></head>
+<body><main><header><div><div class="eyebrow">BAMBU MONITOR / FLEXBAR / DIRECT DRAW</div><h1>抬眼，就知道打印到哪了。</h1><p>四个长条屏方向 · 相同演示数据 · 实际绘制尺寸 2170 × 60 px</p></div><div class="controls"><label for="state">预览状态</label><select id="state"><option value="printing">打印中</option><option value="paused">已暂停</option><option value="finished">已完成</option><option value="stale">数据过期 / 断开</option></select><button id="scale" aria-pressed="false">查看 1:1 原始尺寸</button></div></header>
+<div class="note"><span>全条为等比例设备预览；下方为左侧核心区的 1:1 细节（桌面宽屏）。</span><span>概念稿 · 不代表真机显示效果</span></div>
+<div id="concepts"></div><footer class="foot"><span>仅使用现有字段：状态 / 进度 / 剩余时间 / 温度 / 任务 / 层数 / AMS 槽位 / 故障 / 更新时间。<br>AMS 只显示槽位是否存在；演示中的“无”表示收到明确的无故障上报。</span><span>独立视觉预览<br>尚未替换插件绘制</span></footer></main>
+<script>
+const W=2170,H=60;
+const designs=[
+{id:'graphite',name:'石墨绿',desc:'安静的黑底，进度成为主角。适合日常常驻。',accent:'#a9ecc4'},
+{id:'paper',name:'冷白',desc:'用明暗色块建立层级。数字醒目，读起来最直接。',accent:'#dbe9e1'},
+{id:'ember',name:'暖灰橙',desc:'细线、暖色与宽留白，偏桌面器物的温和质感。',accent:'#f6b37f'},
+{id:'telemetry',name:'深蓝仪表',desc:'分段刻度与紧凑指标，偏精密设备的控制面板。',accent:'#83d9ff'}
+];
+for(const d of designs){const a=document.createElement('article');a.innerHTML=`<div class="title"><div class="name"><span class="num">0${designs.indexOf(d)+1}</span><h2>${d.name}</h2></div><span class="description">${d.desc}</span></div><div class="device"><div class="screen"><canvas id="${d.id}" width="2170" height="60" aria-label="${d.name}完整长条屏"></canvas></div></div><div class="detail"><div class="detail-label">核心区细节<br>原始像素 / 60 px 高</div><div class="detail-window"><canvas id="${d.id}-detail" width="920" height="60" aria-label="${d.name}左侧细节"></canvas></div></div>`;document.getElementById('concepts').append(a);}
+const font='"PingFang SC", "Microsoft YaHei", sans-serif';
+function paint(id,state){
+ const c=document.getElementById(id),x=c.getContext('2d');x.clearRect(0,0,W,H);x.textBaseline='middle';
+ const stale=state==='stale',paused=state==='paused',done=state==='finished';
+ const status=stale?'连接已断开':paused?'已暂停':done?'已完成':'打印中';
+ const pct=done?'100':'68',remaining=stale?'1h 24m · 旧':done?'已完成':'1h 24m';
+ const progress=done?1:.68;
+ let bg,fg,sub,accent,line,card;
+ if(id==='graphite'){bg='#101714';fg='#ecf5ef';sub='#91a79b';accent='#a9ecc4';line='#2c3c32';card='#1b2821';}
+ if(id==='paper'){bg='#e9eee9';fg='#1e3028';sub='#5d7467';accent='#224e3b';line='#c4d0c6';card='#dce5dc';}
+ if(id==='ember'){bg='#211e1b';fg='#f6eee5';sub='#b1a293';accent='#f6b37f';line='#4b3b30';card='#302821';}
+ if(id==='telemetry'){bg='#101b29';fg='#e2f1ff';sub='#8bacc4';accent='#83d9ff';line='#2b455d';card='#182c40';}
+ const signal=stale?(id==='paper'?'#6f7671':'#a5aaa6'):paused?(id==='paper'?'#865616':'#f4c577'):accent;
+ function rect(a,b,w,h,color){x.fillStyle=color;x.fillRect(a,b,w,h)}
+ function text(t,a,b,size=20,color=fg,weight=500,max){x.font=`${weight} ${size}px ${font}`;x.fillStyle=color;const s=String(t);if(max){let out=s;while(x.measureText(out).width>max&&out.length>1)out=out.slice(0,-1);x.fillText(out===s?s:out.slice(0,-1)+'…',a,b);}else x.fillText(s,a,b);}
+ function v(a){rect(a,12,1,36,line)}
+ function dot(a,b,col=signal){x.beginPath();x.arc(a,b,3,0,Math.PI*2);x.fillStyle=col;x.fill()}
+ function pair(a,label,value,width){text(label,a,14,12,sub,450);text(value,a,39,23,fg,500,width)}
+ function temps(a,label,val,target){text(label,a,14,12,sub,450);text(val,a,39,25,fg,550);text('/ '+target+'°',a+62,40,16,sub,450);}
+ function track(a,b,w,h){rect(a,b,w,h,line);rect(a,b,w*progress,h,signal)}
+ function slots(a,b){for(let i=0;i<4;i++){x.strokeStyle=sub;x.lineWidth=1;x.strokeRect(a+i*34,b-9,24,19);if(i!==2)rect(a+i*34+4,b-5,16,11,stale?sub:accent);text(i+1,a+i*34+8,b+17,10,sub,400)}}
+ rect(0,0,W,H,bg);
+ if(id==='graphite'){
+  rect(0,0,4,60,signal);dot(25,18);text('P1S',39,18,16,fg,650);text(stale?'全部数据已过期':'云端已连接',23,43,12,sub);v(174);
+  text(pct,198,29,39,stale?sub:accent,600);text('%',252+(done?20:0),34,16,sub);text(status,306,20,14,signal);text(stale?'上次进度 · 旧数据':'桌面收纳盒',306,43,12,sub,166);track(198,55,280,3);v(500);
+  pair(526,'剩余时间',remaining,210);v(746);temps(772,'喷嘴',stale?'220*':'220','220');temps(958,'热床',stale?'55*':'55','55');v(1124);
+  pair(1150,'当前层数',done?'300 / 300':'204 / 300',175);v(1360);text('AMS 槽位',1386,14,12,sub);slots(1386,34);v(1570);
+  pair(1596,'设备故障',stale?'无 · 旧数据':'无',205);v(1834);text(stale?'上次设备上报':'最近设备上报',1860,15,12,sub);dot(1864,41);text('12:32:40'+(stale?' · 旧':''),1876,41,20,sub);
+ }
+ if(id==='paper'){
+  rect(0,0,326,60,'#234b39');text('P1S',20,17,13,'#a9c2b2',600);dot(24,42,paused?'#ffd28b':stale?'#afb7b1':'#c4f4d2');text(status,37,42,16,'#ecf8ef');text(pct,177,31,40,'#fff',600);text('%',257+(done?17:0),37,17,'#b4d0bc');rect(0,57,326*progress,3,signal);
+  pair(356,'剩余时间',remaining,210);v(580);text('当前任务',610,14,12,sub);text('桌面收纳盒',610,39,23,fg,500,250);v(902);
+  temps(932,'喷嘴 · 当前 / 目标','220','220');temps(1116,'热床 · 当前 / 目标','55','55');v(1290);pair(1320,'层数',done?'300 / 300':'204 / 300',180);v(1512);
+  text('AMS 槽位',1542,14,12,sub);slots(1542,34);v(1722);pair(1752,'设备故障',stale?'无（旧）':'无',135);v(1898);pair(1928,stale?'上次上报 · 所有数值为旧数据':'最近上报 · 云端已连接','12:32:40',220);
+ }
+ if(id==='ember'){
+  rect(0,0,W,2,line);text('BAMBU',22,16,11,sub,500);text('P1S',22,41,22,fg,500);v(158);
+  text(pct,184,30,40,stale?sub:accent,450);text('%',241+(done?22:0),36,17,sub);text(status,302,17,13,signal);track(302,35,200,4);text(stale?'进度为旧数据':'打印进度',302,50,10,sub);v(530);
+  pair(560,'剩余时间',remaining,200);v(778);pair(808,'当前任务','桌面收纳盒',260);v(1094);temps(1124,'喷嘴温度','220','220');temps(1310,'热床温度','55','55');v(1478);
+  pair(1508,'层数',done?'300 / 300':'204 / 300',165);v(1704);text('AMS',1734,14,12,sub);text('1 有   2 有   3 空   4 有',1734,39,17,fg,450);v(1944);text(stale?'连接断开 · 全部数据过期':'云端已连接 · 故障：无',1974,16,12,signal);text('12:32:40',1974,41,20,sub);
+ }
+ if(id==='telemetry'){
+  rect(0,0,194,60,card);text('P1S',20,18,18,fg,600);dot(23,43);text(status,36,43,12,signal);
+  text(pct,219,28,38,stale?sub:accent,600);text('%',274+(done?20:0),34,16,sub);for(let i=0;i<32;i++)rect(220+i*8,53,5,3,i<Math.round(progress*32)?signal:line);
+  text('剩余时间',330,14,12,sub);text(remaining,330,36,22,fg,550,170);v(510);
+  temps(536,'喷嘴 °C','220','220');temps(720,'热床 °C','55','55');v(892);pair(918,'当前层 / 总层',done?'300 / 300':'204 / 300',180);v(1118);
+  pair(1144,'任务','桌面收纳盒',250);v(1422);text('AMS 槽位',1448,14,12,sub);for(let i=0;i<4;i++){rect(1448+i*38,28,29,24,i===2?bg:line);text(i+1,1457+i*38,40,14,i===2?sub:accent)}v(1630);
+  pair(1656,'设备故障',stale?'无 · 旧':'无',140);v(1826);text(stale?'断开 · 所有数值为旧数据':'云端已连接 · 最近上报',1852,14,12,signal);text('12:32:40',1852,39,23,fg);rect(2148,15,3,30,signal);
+ }
+ const detail=document.getElementById(id+'-detail').getContext('2d');detail.clearRect(0,0,920,60);detail.drawImage(c,0,0,920,60,0,0,920,60);
+}
+function render(){for(const d of designs)paint(d.id,document.getElementById('state').value)}
+document.getElementById('state').onchange=render;document.getElementById('scale').onclick=function(){const active=document.body.classList.toggle('native');this.setAttribute('aria-pressed',String(active));this.textContent=active?'返回等比例对比':'查看 1:1 原始尺寸';};render();
+</script></body></html>

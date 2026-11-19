@@ -37,7 +37,7 @@
         "children": [
             {
                 "title": "打印机状态",
-                "tip": "选择打印机，点击查看全屏状态",
+                "tip": "选择打印机；触摸屏幕请求完整状态",
                 "cid": "com.upkiry.bambumonitor.monitor",
                 "config": {
                     "keyType": "directDraw",

@@ -1,4 +1,5 @@
 const https = require("node:https");
+const { sanitizePayload } = require("../admin/debug-redaction");
 const os = require("node:os");
 const { URL } = require("node:url");
 const { listRegions, resolveRegion, regionMismatchHint } = require("./region");
@@ -251,7 +252,7 @@ function request({
  * 转换成明确的领域对象；上层只看到 accessToken / devices / uid。
  */
 class CloudApi {
-  constructor({ region = "global", regionConfig, timeoutMs = DEFAULT_TIMEOUT_MS, requestFn, onRequest } = {}) {
+  constructor({ region = "global", regionConfig, timeoutMs = DEFAULT_TIMEOUT_MS, requestFn, onRequest, onFrame } = {}) {
     const resolved = regionConfig || resolveRegion(region);
     this.regionId = resolved.id;
     this.regionLabel = resolved.label;
@@ -259,6 +260,7 @@ class CloudApi {
     this.timeoutMs = timeoutMs;
     this.requestFn = requestFn || request;
     this.onRequest = typeof onRequest === "function" ? onRequest : null;
+    this.onFrame = typeof onFrame === "function" ? onFrame : null;
     this.lastRequestAt = 0;
   }
 
@@ -293,6 +295,23 @@ class CloudApi {
       responseStatus = response.status;
       this.lastRequestAt = Date.now();
       const parsed = parseJson(response.text);
+      if (this.onFrame) {
+        try {
+          const source = String(path).split(/[?#]/, 1)[0];
+          // Authentication/profile bodies can carry arbitrary personal data. Keep metadata only.
+          const metadataOnly = /\/(?:user-service|design-user-service)\//.test(source);
+          const invalidJson = parsed === null && String(response.text || "").trim() !== "null";
+          const safe = invalidJson
+            ? { payload: { metadataOnly: true, json: false, parseError: true, bodyOmitted: true, bytes: Buffer.byteLength(String(response.text || "")) }, truncated: false }
+            : metadataOnly
+              ? { payload: { metadataOnly: true, json: true }, truncated: false }
+              : sanitizePayload(parsed);
+          const result = this.onFrame({ protocol: "http", source, method, status: response.status, at: this.lastRequestAt, ...safe });
+          if (result && typeof result.catch === "function") result.catch(() => {});
+        } catch {
+          // Capture errors must not change the request result.
+        }
+      }
       if (response.status >= 200 && response.status < 300 && (!parsed || parsed.error)) {
         // 200 里也可能带业务错误，统一按业务错误处理。
         if (parsed?.error) {

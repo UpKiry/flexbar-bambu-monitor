@@ -21,7 +21,7 @@ const FRESH_FIELDS = {
   activity: "activity", rawActivity: "rawActivity", progressPercent: "progressPercent",
   remainingMinutes: "remainingMinutes", taskName: "taskName", rawTaskName: "rawTaskName",
   taskId: "taskId", nozzleCurrent: "nozzle.current", nozzleTarget: "nozzle.target",
-  bedCurrent: "bed.current", bedTarget: "bed.target", layerNum: "layerNum",
+  bedCurrent: "bed.current", bedTarget: "bed.target", chamberCurrent: "chamber.current", layerNum: "layerNum",
   totalLayerNum: "totalLayerNum", printError: "printError", printErrorCode: "printErrorCode", hms: "hms",
 };
 const MAX_FRESHNESS_UNITS = 64;
@@ -74,14 +74,47 @@ function recordAmsFreshness(freshness, oldAms, ams, patch, at, presenceFresh) {
   for (const unit of ams.units || []) {
     const oldUnit = oldAms?.units?.find((item) => item.id === unit.id);
     const update = patch.units?.find((item) => item.id === unit.id);
-    if (update && Object.hasOwn(update, "slots") && (!update.slots || update.slots.length === 0)) delete meta.units[unit.id];
+    if (update?.model && oldUnit?.model && update.model !== oldUnit.model) delete meta.units[unit.id];
+    if (update && Object.hasOwn(update, "slots") && (!update.slots || update.slots.length === 0)) {
+      if (meta.units[unit.id]) {
+        meta.units[unit.id].slots = {};
+        if (Object.keys(meta.units[unit.id]).length === 1) delete meta.units[unit.id];
+      }
+    }
+    if (update && Object.hasOwn(update, "rawInfo")) {
+      if (meta.units[unit.id] || Object.keys(meta.units).length < MAX_FRESHNESS_UNITS) {
+        meta.units[unit.id] ||= { slots: {} };
+        meta.units[unit.id].rawInfo = stamp(at);
+      }
+    }
+    if (update && (Object.hasOwn(update, "model") || Object.hasOwn(update, "zones"))) {
+      if (meta.units[unit.id] || Object.keys(meta.units).length < MAX_FRESHNESS_UNITS) {
+        const unitMeta = meta.units[unit.id] ||= { slots: {} };
+        if (Object.hasOwn(update, "model")) {
+          unitMeta.model = stamp(at);
+          if (oldUnit?.model === "AMS 3H" && unit.model !== "AMS 3H") delete unitMeta.zones;
+        }
+        if (Object.hasOwn(update, "zones")) {
+          if (!update.zones?.length) unitMeta.zones = {};
+          for (const zone of unit.zones || []) {
+            const change = update.zones?.find(item => item.id === zone.id);
+            if (!change) continue;
+            const zoneMeta = (unitMeta.zones ||= {})[zone.id] ||= {};
+            for (const field of ["temperature", "humidity", "dryingMinutes"]) {
+              if (Object.hasOwn(change, field)) zoneMeta[field] = stamp(at);
+            }
+          }
+        }
+      }
+    }
     for (const slot of unit.slots || []) {
       const oldSlot = oldUnit?.slots?.find((item) => item.id === slot.id);
       const change = update?.slots?.find((item) => item.id === slot.id);
-      const presenceChanged = oldSlot && oldSlot.exists !== slot.exists;
-      if (!change && !Object.hasOwn(patch, "existBits")) continue;
+      const presenceChanged = oldSlot && slot.exists !== null && oldSlot.exists !== slot.exists;
+      if (!change && !Object.hasOwn(patch, "existBits") && oldSlot?.exists === slot.exists) continue;
       const slotMeta = slotFreshness(meta, unit.id, slot.id);
       if (!slotMeta) continue;
+      if (slot.exists === null) delete slotMeta.exists;
       if (Object.hasOwn(patch, "existBits") && slot.exists !== null) slotMeta.exists = stamp(at);
       else if (!oldSlot && slot.exists !== null && meta.fields.existBits) slotMeta.exists = { ...meta.fields.existBits };
       if (presenceChanged || (slot.exists === false && presenceFresh)) {
@@ -105,11 +138,14 @@ function cloneState(state) {
     freshness: structuredClone(state.freshness || { fields: {}, ams: { fields: {}, units: {} } }),
     nozzle: { ...state.nozzle },
     bed: { ...state.bed },
+    chamber: { current: null, ...state.chamber },
+    fans: { part: null, auxiliary: null, chamber: null, heatbreak: null, ...state.fans },
+    rawFans: { part: null, auxiliary: null, chamber: null, heatbreak: null, ...state.rawFans },
     hms: state.hms ? state.hms.map((item) => ({ ...item })) : state.hms,
     ams: state.ams ? {
       ...state.ams,
       current: state.ams.current ? { ...state.ams.current } : null,
-      units: state.ams.units?.map((unit) => ({ ...unit, slots: unit.slots?.map((slot) => ({ ...slot })) ?? null })) ?? null,
+      units: structuredClone(state.ams.units) ?? null,
     } : null,
   };
 }
@@ -118,10 +154,16 @@ function emptyAms() {
   return { units: [], current: null, rawTrayNow: null, rawStatus: null, existBits: null };
 }
 
+// The legacy global mask only establishes presence for known four-slot layouts.
+function usesLegacyPresence(unit) {
+  return unit.model !== "AMS 3H" && !Object.hasOwn(unit, "zones") &&
+    Number(unit.id) < 4 && !(unit.slots || []).some(slot => Number(slot.id) >= 4);
+}
+
 function updatePresence(slot, unitId, bits) {
   const unit = Number(unitId);
   const index = Number(slot.id);
-  if (bits == null || !Number.isSafeInteger(unit) || unit < 0 || unit >= 128 ||
+  if (bits == null || !Number.isSafeInteger(unit) || unit < 0 || unit >= 4 ||
       !Number.isSafeInteger(index) || index < 0 || index >= 4) return;
   const exists = ((BigInt(`0x${bits}`) >> BigInt(unit * 4 + index)) & 1n) === 1n;
   if (!exists || slot.exists === false) {
@@ -141,7 +183,11 @@ function mergeAms(previous, patch, presenceFresh = true) {
   if (Object.hasOwn(patch, "existBits")) {
     result.existBits = patch.existBits;
     for (const unit of result.units || []) {
-      for (const slot of unit.slots || []) updatePresence(slot, unit.id, result.existBits);
+      const update = patch.units?.find(item => item.id === unit.id);
+      const layout = { ...unit, ...update, slots: [...(unit.slots || []), ...(update?.slots || [])] };
+      if (usesLegacyPresence(layout)) {
+        for (const slot of unit.slots || []) updatePresence(slot, unit.id, result.existBits);
+      }
     }
   }
   if (Object.hasOwn(patch, "units")) {
@@ -157,6 +203,34 @@ function mergeAms(previous, patch, presenceFresh = true) {
         unit = { id: update.id, slots: null };
         result.units.push(unit);
       }
+      if (Object.hasOwn(update, "model")) {
+        if (unit.model && update.model !== unit.model) {
+          unit.slots = null;
+          delete unit.zones;
+          delete unit.rawInfo;
+        }
+        unit.model = update.model;
+      }
+      if (Object.hasOwn(update, "rawInfo")) unit.rawInfo = update.rawInfo;
+      if (Object.hasOwn(update, "zones")) {
+        if (!update.zones?.length) unit.zones = update.zones === null ? null : [];
+        else {
+          unit.zones ||= [];
+          for (const zoneUpdate of update.zones) {
+            let zone = unit.zones.find(item => item.id === zoneUpdate.id);
+            if (!zone) {
+              if (unit.zones.length >= MAX_FRESHNESS_SLOTS) continue;
+              zone = { id: zoneUpdate.id, temperature: null, humidity: null, dryingMinutes: null };
+              unit.zones.push(zone);
+            }
+            Object.assign(zone, zoneUpdate);
+          }
+        }
+      }
+      const legacyPresence = usesLegacyPresence({ ...unit, slots: [...(unit.slots || []), ...(update.slots || [])] });
+      if (!legacyPresence) {
+        for (const slot of unit.slots || []) slot.exists = null;
+      }
       if (Object.hasOwn(update, "slots")) {
         if (update.slots === null) {
           unit.slots = null;
@@ -168,10 +242,10 @@ function mergeAms(previous, patch, presenceFresh = true) {
           if (!slot) {
             if (unit.slots.length >= MAX_FRESHNESS_SLOTS) continue;
             slot = { id: updateSlot.id, color: null, material: null, remaining: null, rawState: null, exists: null };
-            if (presenceFresh) updatePresence(slot, unit.id, result.existBits);
+            if (presenceFresh && legacyPresence) updatePresence(slot, unit.id, result.existBits);
             unit.slots.push(slot);
           }
-          if (slot.exists === false && presenceFresh) {
+          if (slot.exists === false && presenceFresh && legacyPresence) {
             // Ignore material metadata for a slot reported absent.
             if (Object.hasOwn(updateSlot, "rawState")) slot.rawState = updateSlot.rawState;
           } else {
@@ -196,13 +270,26 @@ function clearTaskFields(state) {
  * @param {{ receivedAt?: number, previousTaskName?: string|null }} [options]
  * @returns {{ state: object, reason: string|null, taskSwitched: boolean }}
  */
-function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
+function reduceReport(state, raw, { receivedAt = Date.now(), amsIdentities = [] } = {}) {
   const base = state ? cloneState(state) : emptyPrinterState();
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  const identities = Array.isArray(amsIdentities) ? amsIdentities.filter(item => item &&
+    typeof item.id === "string" && /^\d+$/.test(item.id) && Number.isSafeInteger(Number(item.id)) &&
+    ["AMS", "AMS Lite", "AMS 2 Pro", "AMS HT", "AMS 3H"].includes(item.model)) : [];
+  if ((!raw || typeof raw !== "object" || Array.isArray(raw)) && !identities.length) {
     return { state: base, reason: "invalid-report", taskSwitched: false };
   }
 
   const patch = mapReport(raw);
+  const hasPrintUpdate = Object.keys(patch).length > 0;
+  if (identities.length) {
+    patch.ams ||= {};
+    patch.ams.units ||= [];
+    for (const identity of identities) {
+      const unit = patch.ams.units.find(item => item.id === identity.id);
+      if (unit) unit.model = identity.model;
+      else patch.ams.units.push({ id: identity.id, model: identity.model });
+    }
+  }
   if (Object.keys(patch).length === 0) {
     return { state: base, reason: "empty-report", taskSwitched: false };
   }
@@ -245,7 +332,11 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
     const oldAms = next.ams ? structuredClone(next.ams) : null;
     const hasNewBits = Object.hasOwn(patch.ams || {}, "existBits");
     const presenceMeta = next.freshness.ams;
-    const presenceFresh = hasNewBits || presenceIsFresh(presenceMeta.fields.existBits, receivedAt);
+    const modelChanged = patch.ams?.units?.some(update => {
+      const old = oldAms?.units?.find(unit => unit.id === update.id);
+      return update.model && old?.model && old.model !== update.model;
+    });
+    const presenceFresh = hasNewBits || (!modelChanged && presenceIsFresh(presenceMeta.fields.existBits, receivedAt));
     if (!presenceFresh) {
       // 长时间未更新、断线或时钟回退后，旧空槽只是旧观测，不能阻挡新数据。
       if (presenceMeta.fields.existBits) presenceMeta.fields.existBits.stale = true;
@@ -271,6 +362,13 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
   if (Object.hasOwn(patch, "nozzleTarget")) next.nozzle = { ...next.nozzle, target: patch.nozzleTarget };
   if (Object.hasOwn(patch, "bedCurrent")) next.bed = { ...next.bed, current: patch.bedCurrent };
   if (Object.hasOwn(patch, "bedTarget")) next.bed = { ...next.bed, target: patch.bedTarget };
+  if (Object.hasOwn(patch, "chamberCurrent")) next.chamber = { ...next.chamber, current: patch.chamberCurrent };
+
+  for (const group of ["fans", "rawFans"]) {
+    if (!patch[group]) continue;
+    Object.assign(next[group], patch[group]);
+    for (const fan of Object.keys(patch[group])) next.freshness.fields[`${group}.${fan}`] = stamp(receivedAt);
+  }
 
   if (Object.hasOwn(patch, "layerNum")) next.layerNum = patch.layerNum;
   if (Object.hasOwn(patch, "totalLayerNum")) next.totalLayerNum = patch.totalLayerNum;
@@ -278,9 +376,11 @@ function reduceReport(state, raw, { receivedAt = Date.now() } = {}) {
   for (const [source, field] of Object.entries(FRESH_FIELDS)) {
     if (Object.hasOwn(patch, source)) next.freshness.fields[field] = stamp(receivedAt);
   }
-  next.lastReportAt = receivedAt;
-  // 仅表示本连接已收到有效报告；各字段必须检查 freshness。
-  next.reportStale = false;
+  if (hasPrintUpdate) {
+    next.lastReportAt = receivedAt;
+    // 身份元数据不能把打印遥测标为实时。
+    next.reportStale = false;
+  }
   return { state: next, reason, taskSwitched };
 }
 

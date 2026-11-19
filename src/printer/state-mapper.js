@@ -28,6 +28,7 @@ const RAW_FIELDS = {
   nozzleTarget: "nozzle_target_temper",
   bedCurrent: "bed_temper",
   bedTarget: "bed_target_temper",
+  chamberCurrent: "chamber_temper",
   printError: "print_error",
   printErrorCode: "mc_print_error_code",
   hms: "hms",
@@ -39,6 +40,78 @@ const RAW_FIELDS = {
 const FULL_SNAPSHOT_FIELDS = ["gcode_state", "mc_percent", "nozzle_temper", "bed_temper"];
 
 const MAX_TASK_NAME = 60;
+
+const FAN_FIELDS = {
+  part: "cooling_fan_speed",
+  auxiliary: "big_fan1_speed",
+  chamber: "big_fan2_speed",
+  heatbreak: "heatbreak_fan_speed",
+};
+
+/**
+ * Legacy 独立字段使用 0–15 PWM 档位；不是 RPM，也不是 fan_gear 的 0–255 字节。
+ * 依据：BambuStudio src/slic3r/GUI/DeviceCore/DevFan.cpp ParseV1_0：
+ * https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/DeviceCore/DevFan.cpp
+ * heatbreak 参考 BambuHelper 的 legacyToPct 普通模式，0–15 换算后向下取整：
+ * https://github.com/Keralots/BambuHelper/blob/0ca5f3d12f299abc8e2ce50de743c5d809ab45e4/src/bambu_mqtt.cpp
+ * 其余三个通道保留原有四舍五入；越界值不钳位为有效百分比。
+ * 当前验收目标为 A1；未报告的辅助/机箱风扇不能推断为已安装或 0%。
+ */
+function mapFanPercent(value, round = Math.round) {
+  // 只接受十进制整数，避免把未知的十六进制/打包编码当成 PWM 档位。
+  if (typeof value === "string" && !/^\d+$/.test(value.trim())) return null;
+  const step = finiteNumber(value);
+  return Number.isInteger(step) && step >= 0 && step <= 15 ? round(step * 100 / 15) : null;
+}
+
+function mapFans(raw, patch) {
+  for (const [fan, source] of Object.entries(FAN_FIELDS)) {
+    if (!Object.hasOwn(raw, source)) continue;
+    const value = raw[source];
+    // 仅保留协议标量，不把格式错误的对象保存为状态。
+    if (value !== null && typeof value !== "string" &&
+        !(typeof value === "number" && Number.isFinite(value))) continue;
+    (patch.rawFans ||= {})[fan] = value;
+    const percent = mapFanPercent(value, fan === "heatbreak" ? Math.floor : Math.round);
+    // 与温度一致：显式 null 清空，格式错误/越界不更新百分比及其 freshness。
+    if (value === null || percent !== null) (patch.fans ||= {})[fan] = percent;
+  }
+}
+
+/** 新协议温度：低 16 位为当前温度，高 16 位为目标温度。
+ * 官方 DevBed/DevChamber/DevExtruder 的 ParseV2_0；不把双喷头数组首项当当前喷头。
+ */
+function mapDeviceTemperatures(device, patch) {
+  if (!device || typeof device !== "object" || Array.isArray(device)) return;
+  const apply = (value, current, target) => {
+    if (value === null) {
+      patch[current] = null;
+      if (target) patch[target] = null;
+    } else if (Number.isInteger(value) && value >= 0 && value < 0xffffffff) {
+      patch[current] = value & 0xffff;
+      if (target) patch[target] = value >>> 16;
+    }
+  };
+  if (Object.hasOwn(device, "bed_temp")) apply(device.bed_temp, "bedCurrent", "bedTarget");
+  // ha-bambulab 的新固件适配也接收 device.bed.info.temp。
+  const bed = device.bed?.info;
+  if (bed && Object.hasOwn(bed, "temp")) apply(bed.temp, "bedCurrent", "bedTarget");
+  const ctc = device.ctc?.info;
+  if (ctc && Object.hasOwn(ctc, "temp")) apply(ctc.temp, "chamberCurrent");
+  const extruder = device.extruder;
+  if (!extruder || !Number.isInteger(extruder.state) || extruder.state < 0 || extruder.state > 0xffffffff) return;
+  // 双喷头的 legacy 顶层温度可能是占位值，不能当作当前喷头。
+  if ((extruder.state & 0xf) > 1) {
+    delete patch.nozzleCurrent;
+    delete patch.nozzleTarget;
+  }
+  if (!Array.isArray(extruder.info)) return;
+  const activeId = (extruder.state >>> 4) & 0xf;
+  const entries = extruder.info.filter(item => item && item.id === activeId);
+  if (entries.length === 1 && Object.hasOwn(entries[0], "temp")) {
+    apply(entries[0].temp, "nozzleCurrent", "nozzleTarget");
+  }
+}
 
 function finiteNumber(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -126,6 +199,43 @@ function amsId(value) {
   return number !== null && Number.isSafeInteger(number) && number >= 0 ? String(number) : null;
 }
 
+/** Version metadata allowlist: never retain module serials or firmware payloads. */
+function mapAmsIdentities(modules) {
+  if (!Array.isArray(modules)) return [];
+  const identities = new Map();
+  for (const module of modules) {
+    if (!module || typeof module !== "object" || Array.isArray(module) || typeof module.name !== "string") continue;
+    const match = /^(n10a|ams|ams_f1|n3f|n3s)(?:\/(\d+))?$/.exec(module.name);
+    if (!match || (match[1] !== "n10a" && match[2] === undefined)) continue;
+    const value = Object.hasOwn(module, "id") ? module.id : match[2];
+    if (!(typeof value === "number" || (typeof value === "string" && /^\d+$/.test(value)))) continue;
+    const id = amsId(value);
+    const model = { n10a: "AMS 3H", ams: "AMS", ams_f1: "AMS Lite", n3f: "AMS 2 Pro", n3s: "AMS HT" }[match[1]];
+    if (id !== null) identities.set(id, { id, model });
+  }
+  return [...identities.values()];
+}
+
+function mapAmsZones(zones) {
+  if (zones === null) return null;
+  if (!Array.isArray(zones)) return undefined;
+  const mapped = zones.flatMap(zone => {
+    if (!zone || typeof zone !== "object" || Array.isArray(zone)) return [];
+    const id = amsId(zone.zone_id);
+    if (id === null) return [];
+    const result = { id };
+    for (const [source, field] of [["temp", "temperature"], ["humidity_raw", "humidity"], ["dry_time", "dryingMinutes"]]) {
+      if (!Object.hasOwn(zone, source)) continue;
+      const value = finiteNumber(zone[source]);
+      if (zone[source] === null) result[field] = null;
+      else if (value !== null && (field !== "humidity" || (value >= 0 && value <= 100)) &&
+          (field !== "dryingMinutes" || (Number.isSafeInteger(value) && value >= 0))) result[field] = value;
+    }
+    return [result];
+  });
+  return zones.length && !mapped.length ? undefined : mapped;
+}
+
 function amsRawValue(value) {
   return typeof value === "string" || (typeof value === "number" && Number.isFinite(value)) ? value : null;
 }
@@ -157,6 +267,12 @@ function mapAms(raw) {
         const id = amsId(unit.id);
         if (id === null) return [];
         const mapped = { id };
+        const zones = mapAmsZones(unit.zone_info);
+        if (zones !== undefined) mapped.zones = zones;
+        if (unit.info === null) mapped.rawInfo = null;
+        else if (typeof unit.info === "string" && /^(?:0x)?[0-9a-f]{1,128}$/i.test(unit.info.trim())) {
+          mapped.rawInfo = unit.info.trim();
+        }
         if (unit.tray === null) {
           mapped.slots = null;
         } else if (Array.isArray(unit.tray)) {
@@ -218,10 +334,12 @@ function mapReport(raw) {
     patch.rawTaskName = rawTaskName(raw.subtask_name);
   }
   if (Object.hasOwn(raw, "task_id")) patch.taskId = mapTaskId(raw.task_id);
+  mapFans(raw, patch);
   if (Object.hasOwn(raw, RAW_FIELDS.nozzleCurrent)) patch.nozzleCurrent = mapTemperature(raw.nozzle_temper);
   if (Object.hasOwn(raw, RAW_FIELDS.nozzleTarget)) patch.nozzleTarget = mapTemperature(raw.nozzle_target_temper);
   if (Object.hasOwn(raw, RAW_FIELDS.bedCurrent)) patch.bedCurrent = mapTemperature(raw.bed_temper);
   if (Object.hasOwn(raw, RAW_FIELDS.bedTarget)) patch.bedTarget = mapTemperature(raw.bed_target_temper);
+  if (Object.hasOwn(raw, RAW_FIELDS.chamberCurrent)) patch.chamberCurrent = mapTemperature(raw.chamber_temper);
   if (Object.hasOwn(raw, RAW_FIELDS.layerNum)) patch.layerNum = finiteNumber(raw.layer_num);
   if (Object.hasOwn(raw, RAW_FIELDS.totalLayerNum)) patch.totalLayerNum = finiteNumber(raw.total_layer_num);
   if (Object.hasOwn(raw, RAW_FIELDS.hms)) patch.hms = mapHms(raw.hms);
@@ -238,7 +356,7 @@ function mapReport(raw) {
   for (const [field, source] of Object.entries({
     progressPercent: "mc_percent", remainingMinutes: "mc_remaining_time",
     nozzleCurrent: "nozzle_temper", nozzleTarget: "nozzle_target_temper",
-    bedCurrent: "bed_temper", bedTarget: "bed_target_temper",
+    bedCurrent: "bed_temper", bedTarget: "bed_target_temper", chamberCurrent: "chamber_temper",
     layerNum: "layer_num", totalLayerNum: "total_layer_num",
   })) {
     if (Object.hasOwn(patch, field) && raw[source] !== null && patch[field] === null) delete patch[field];
@@ -261,6 +379,7 @@ function mapReport(raw) {
     if (Object.hasOwn(patch, field) && value !== null &&
         !((typeof value === "string" && value.trim()) || (typeof value === "number" && Number.isFinite(value)))) delete patch[field];
   }
+  mapDeviceTemperatures(raw.device, patch);
   return patch;
 }
 
@@ -300,6 +419,9 @@ function emptyPrinterState(printerId) {
     taskId: null,
     nozzle: { current: null, target: null },
     bed: { current: null, target: null },
+    chamber: { current: null },
+    fans: { part: null, auxiliary: null, chamber: null, heatbreak: null },
+    rawFans: { part: null, auxiliary: null, chamber: null, heatbreak: null },
     layerNum: null,
     totalLayerNum: null,
     printError: null,
@@ -324,6 +446,7 @@ module.exports = {
   mapErrorCode,
   mapHms,
   mapReport,
+  mapAmsIdentities,
   isFullSnapshot,
   isTaskSwitch,
   emptyPrinterState,

@@ -134,6 +134,47 @@ test("reported AMS ids survive without inferred slot properties", () => {
   });
 });
 
+test("heatbreak legacy steps follow BambuHelper ordinary mode without ten-percent quantization", () => {
+  for (const [value, percent] of [[0, 0], ["0", 0], [" 8 ", 53], [10, 66], ["15", 100]]) {
+    assert.deepEqual(mapReport({ heatbreak_fan_speed: value }), {
+      fans: { heatbreak: percent }, rawFans: { heatbreak: value },
+    });
+  }
+});
+
+// 手工编写的脱敏协议标量；没有复制任何账号或设备完整报文。
+test("legacy fan steps map independently to rounded percentages and retain raw values", () => {
+  const patch = mapReport({ cooling_fan_speed: "15", big_fan1_speed: 6, big_fan2_speed: "0", heatbreak_fan_speed: "7" });
+  assert.deepEqual(patch.fans, { part: 100, auxiliary: 40, chamber: 0, heatbreak: 46 });
+  assert.deepEqual(patch.rawFans, { part: "15", auxiliary: 6, chamber: "0", heatbreak: "7" });
+  for (let step = 0; step <= 15; step++) {
+    assert.equal(mapReport({ cooling_fan_speed: String(step) }).fans.part, Math.round(step * 100 / 15));
+  }
+  assert.deepEqual(mapReport({ big_fan1_speed: " 3 " }).fans, { auxiliary: 20 });
+  assert.deepEqual(emptyPrinterState().fans, { part: null, auxiliary: null, chamber: null, heatbreak: null });
+});
+
+test("unknown fan encodings stay raw without fabricating percentages", () => {
+  for (const source of ["cooling_fan_speed", "big_fan1_speed", "big_fan2_speed", "heatbreak_fan_speed"]) {
+    for (const value of [-1, 16, 100, 255, 1.5, "0x0f", "1e1", "", "future"]) {
+      const patch = mapReport({ [source]: value });
+      assert.equal(patch.fans, undefined);
+      assert.equal(Object.values(patch.rawFans)[0], value);
+    }
+    for (const value of [true, false, {}, [], Infinity, NaN, undefined]) {
+      assert.deepEqual(mapReport({ [source]: value }), {});
+    }
+  }
+  assert.deepEqual(mapReport({ fan_gear: 0x00ff00, device: { airduct: { parts: [{ id: 160, state: 60 }] } } }), {});
+});
+
+test("fan nulls clear only explicitly reported channels", () => {
+  assert.deepEqual(mapReport({ cooling_fan_speed: null, heatbreak_fan_speed: null }), {
+    fans: { part: null, heatbreak: null }, rawFans: { part: null, heatbreak: null },
+  });
+  assert.deepEqual(mapReport({ nozzle_temper: 0 }), { nozzleCurrent: 0 });
+});
+
 test("mapReport tolerates junk input", () => {
   assert.deepEqual(mapReport(null), {});
   assert.deepEqual(mapReport([]), {});
@@ -151,4 +192,56 @@ test("task switches are detected only when a task name is present", () => {
   assert.equal(isTaskSwitch(previous, { subtask_name: "benchy" }), false);
   assert.equal(isTaskSwitch(previous, { mc_percent: 10 }), false);
   assert.equal(isTaskSwitch(null, { subtask_name: "other" }), false);
+});
+
+
+test("chamber temperature uses only the printer field and validates values", () => {
+  assert.equal(emptyPrinterState().chamber.current, null);
+  for (const value of [0, -2, 32.5, "35.5", null]) {
+    assert.deepEqual(mapReport({chamber_temper: value}), {chamberCurrent: value === null ? null : Number(value)});
+  }
+  for (const value of ["", "bad", true, {}, [], undefined, Infinity]) {
+    assert.deepEqual(mapReport({chamber_temper: value}), {});
+  }
+  assert.equal(mapReport({ams: {ams: [{id: "0", temp: "40"}]}}).chamberCurrent, undefined);
+});
+
+test("AMS info retains only bounded hexadecimal text or explicit null", () => {
+  for (const value of ["1", "00102", "0xAf04", " 0000 ", "f".repeat(128), null]) {
+    assert.deepEqual(mapReport({ ams: { ams: [{ id: "0", info: value }] } }).ams.units,
+      [{ id: "0", rawInfo: value === null ? null : value.trim() }]);
+  }
+  for (const value of [undefined, "", " ", "future", "f".repeat(129), 1, true, {}, [], Infinity]) {
+    assert.deepEqual(mapReport({ ams: { ams: [{ id: "0", info: value }] } }).ams.units, [{ id: "0" }]);
+  }
+});
+
+
+test("new printer temperatures decode independently and select extruder by ID", () => {
+  const patch = mapReport({nozzle_temper: 0, nozzle_target_temper: 0, bed_temper: 20,
+    device: {bed_temp: 60 * 65536 + 42, ctc: {info: {temp: 65 * 65536 + 35}},
+      extruder: {state: 0x12, info: [{id: 0, temp: 200 * 65536 + 180}, {id: 1, temp: 240 * 65536 + 220}]}}});
+  assert.equal(patch.bedCurrent, 42);
+  assert.equal(patch.bedTarget, 60);
+  assert.equal(patch.chamberCurrent, 35);
+  assert.equal(patch.nozzleCurrent, 220);
+  assert.equal(patch.nozzleTarget, 240);
+  assert.deepEqual(mapReport({device: {bed: {info: {temp: 0}}}}), {bedCurrent: 0, bedTarget: 0});
+  assert.deepEqual(mapReport({device: {extruder: {state: 1, info: [{id: 0, temp: 0}]}}}), {nozzleCurrent: 0, nozzleTarget: 0});
+});
+
+test("new temperatures reject invalid packed values and ambiguous active nozzles", () => {
+  for (const temp of [-1, 0xffffffff, 0x100000000, 1.5, "123", true, {}, NaN, Infinity]) {
+    assert.deepEqual(mapReport({device: {bed_temp: temp, ctc: {info: {temp}},
+      extruder: {state: 1, info: [{id: 0, temp}]}}}), {});
+    assert.equal(mapReport({bed_temper: 21, device: {bed_temp: temp}}).bedCurrent, 21);
+  }
+  assert.deepEqual(mapReport({device: {bed_temp: null}}), {bedCurrent: null, bedTarget: null});
+  for (const extruder of [
+    {info: [{id: 0, temp: 200}]},
+    {state: 0x12, info: [{id: 0, temp: 200}]},
+    {state: 1, info: [{id: 0, temp: 200}, {id: 0, temp: 210}]},
+  ]) assert.deepEqual(mapReport({device: {extruder}}), {});
+  assert.deepEqual(mapReport({nozzle_temper: 0, nozzle_target_temper: 0,
+    device: {extruder: {state: 0x12, info: []}}}), {});
 });
