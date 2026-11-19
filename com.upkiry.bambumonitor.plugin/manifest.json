@@ -1,7 +1,7 @@
 {
     "name": "Bambu Monitor",
     "uuid": "com.upkiry.bambumonitor",
-    "version": "0.4.0",
+    "version": "0.5.0",
     "author": "upkiry",
     "entry": "backend/plugin.cjs",
     "description": "在 Flexbar 上监控 Bambu Lab 打印机的云端状态与打印进度",

@@ -618,7 +618,10 @@ function createPluginRuntime({
       return {
         status: "success",
         auth: auth.snapshot(),
-        config,
+        // 恢复的令牌所属区域是已登录会话的权威来源；配置可能因旧版本/重启而不同。
+        config: auth.state === STATES.signedIn && auth.getRegion()
+          ? { ...config, region: auth.getRegion() }
+          : config,
         credentialStore: await credentialStore.status(),
         devices,
         devicesError,
@@ -743,8 +746,8 @@ function createPluginRuntime({
     async requestFullState() {
       return printer.requestFullState();
     },
-    async testConnection(payload) {
-      const region = resolveRegion(payload?.region || config.region).id;
+    async testConnection() {
+      const region = resolveRegion(auth.getRegion() || config.region).id;
       const epoch = sessionGeneration;
       const token = auth.getAccessToken();
       const current = () => !shuttingDown && epoch === sessionGeneration && token === auth.getAccessToken() && auth.state === STATES.signedIn;
@@ -792,6 +795,21 @@ function createPluginRuntime({
     const hydrated = await auth.hydrate();
     if (shuttingDown || epoch !== sessionGeneration) return;
     if (hydrated.state === STATES.signedIn) {
+      // 恢复会话的令牌区域优先，并回写配置，避免重启后再次按错误区域登录/验证。
+      const sessionRegion = resolveRegion(auth.getRegion() || config.region).id;
+      if (sessionRegion !== config.region) {
+        await queueConfig(async () => {
+          if (shuttingDown || epoch !== sessionGeneration || auth.state !== STATES.signedIn || auth.getRegion() !== sessionRegion) return;
+          const next = { ...config, region: sessionRegion };
+          config = next;
+          try {
+            await plugin.setConfig?.(next);
+          } catch {
+            safeLogger.warn("保存账号区域配置失败");
+          }
+        });
+      }
+      if (shuttingDown || epoch !== sessionGeneration) return;
       // 不能在确认当前账号设备列表前使用恢复的设备选择。
       refreshDevices().catch((error) => logError("读取设备列表失败", error));
     }

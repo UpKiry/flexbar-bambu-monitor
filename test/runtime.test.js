@@ -406,6 +406,37 @@ test("刷新发现解绑或失败时断开连接并保留配置", async () => {
   assert.match((await runtime.actions.status()).display.subtitle, /读取失败/);
 });
 
+test("连接测试使用已登录会话的区域，而不是可能不同的插件配置区域", async () => {
+  const requestedRegions = [];
+  const plugin = makePlugin({ config: { region: "global", printerId: "", printerName: "" } });
+  const credentialStore = makeStore();
+  await credentialStore.save(JSON.stringify({ session: {
+    accessToken: "tok", region: "china", userId: "42", issuedAt: 1000, expiresAt: 100000,
+  } }));
+  const runtime = createPluginRuntime({
+    plugin,
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    createApi: (region) => {
+      requestedRegions.push(region);
+      return makeApi({ fetchDevices: async () => [] });
+    },
+    credentialStore,
+    configRetryDelayMs: 1,
+    createMqttManager: () => ({ subscribe() {}, disconnect: async () => {}, selectPrinter() {}, connect: () => ({ started: false }), status: {}, state: {} }),
+    now: () => 9000,
+  });
+  await runtime.start();
+  assert.equal(runtime.auth.state, "signed-in");
+  assert.equal(runtime.auth.getRegion(), "china");
+  assert.equal(runtime.config.region, "china");
+  assert.equal((await runtime.actions.status()).config.region, "china");
+  assert.ok(plugin.savedConfigs.some((item) => item.region === "china"));
+  requestedRegions.length = 0;
+  const result = await runtime.actions.testConnection();
+  assert.equal(result.status, "success");
+  assert.deepEqual(requestedRegions, ["china"]);
+});
+
 test("连接测试迟到结果不返回旧账号设备", async () => {
   const pending = deferred();
   let count = 0;

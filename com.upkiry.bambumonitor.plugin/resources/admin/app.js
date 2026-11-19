@@ -744,7 +744,7 @@
       case "login": return "登录成功";
       case "cancelCode": return "已取消验证码登录";
       case "logout": return "已退出登录";
-      case "refreshDevices": return `已刷新设备列表（${Array.isArray(result?.devices) ? result.devices.length : 0} 台）`;
+      case "refreshDevices": return `已更新设备列表（${Array.isArray(result?.devices) ? result.devices.length : 0} 台）`;
       case "setPrinter": return "已更新要显示的打印机";
       case "setRegion": return "账号区域已更新";
       case "requestFullState": return result?.sent ? "已请求完整状态" : "请求完整状态失败";

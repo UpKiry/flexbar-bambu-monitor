@@ -27,6 +27,12 @@ const ok = (data) => ({ status: 200, ok: true, json: async () => data });
 const status = (overrides = {}) => ({ auth: { state: "signed-out" }, config: { region: "china" }, devices: [], ...overrides });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("设备操作按钮清楚区分更新列表与检查连接", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../com.upkiry.bambumonitor.plugin/resources/admin/index.html"), "utf8");
+  assert.match(html, /id="refresh-devices-btn"[^>]*title="[^"]*重新读取账号绑定的打印机列表[^"]*">更新设备列表/);
+  assert.match(html, /id="test-connection-btn"[^>]*title="[^"]*验证当前账号能否读取绑定的打印机列表[^"]*">验证云端访问/);
+});
+
 test("验证码流程锁定区域账号，取消失败保持锁定，成功后解除", async () => {
   let cancelStatus = "error";
   const calls = [];
