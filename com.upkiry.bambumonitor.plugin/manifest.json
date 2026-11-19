@@ -5,7 +5,7 @@
     "author": "upkiry",
     "entry": "backend/plugin.cjs",
     "description": "在 Flexbar 上监控 Bambu Lab 打印机的云端状态与打印进度",
-    "repo": "",
+    "repo": "https://github.com/UpKiry/flexbar-bambu-monitor",
     "sdk": {
         "version": "1.0.7"
     },

@@ -3,11 +3,35 @@ name: Pack files and release
 
 on:
   push:
+    branches:
+      - "**"
     tags:
       - "v*"
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
   build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions: write-all
     runs-on: ubuntu-latest
 
