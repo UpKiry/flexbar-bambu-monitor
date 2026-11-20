@@ -9,15 +9,15 @@
 任务 · 层数 · 进度 · 剩余时间 · 喷嘴与热床 · 风扇 · AMS 槽位，一眼看全。
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-v0.7.1-cfe36b?labelColor=14181a&style=flat-square" />
-  <img alt="tests" src="https://img.shields.io/badge/tests-419%20passing-3fb950?labelColor=14181a&style=flat-square" />
+  <img alt="version" src="https://img.shields.io/badge/version-v0.7.2-cfe36b?labelColor=14181a&style=flat-square" />
+  <img alt="tests" src="https://img.shields.io/badge/tests-430%20passing-3fb950?labelColor=14181a&style=flat-square" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-8d9b90?labelColor=14181a&style=flat-square" />
   <img alt="CI" src="https://github.com/UpKiry/flexbar-bambu-monitor/actions/workflows/release.yml/badge.svg" />
 </p>
 
-**[⬇ 下载最新安装包](https://github.com/UpKiry/flexbar-bambu-monitor/releases/latest)**  ·  **[📚 文档导航](docs/README.md)**  ·  **[🧾 v0.7.1 发行说明](docs/releases/v0.7.1.md)**  ·  **[🐛 反馈问题](https://github.com/UpKiry/flexbar-bambu-monitor/issues)**
+**[⬇ 下载最新安装包](https://github.com/UpKiry/flexbar-bambu-monitor/releases/latest)**  ·  **[📚 文档导航](docs/README.md)**  ·  **[🧾 v0.7.2 发行说明](docs/releases/v0.7.2.md)**  ·  **[🐛 反馈问题](https://github.com/UpKiry/flexbar-bambu-monitor/issues)**
 
 </div>
 
@@ -92,7 +92,7 @@ npm run plugin:install  # 覆盖安装，需先启动 FlexDesigner
 | **打印活动** | 打印中 / 暂停 / 完成 / 空闲 … | 与在线状态独立维护；离线不会把任务改写成空闲。 |
 | **旧值标记** | 「旧」 | 字段级观测时间；持续有效的遥测不会让稳定读数仅因单字段年龄被误标。 |
 
-自动刷新遵循统一调度：订阅后 5 秒按需补全核心字段；在线字段缺失或标旧持续 30 秒后有限补全；健康时每 15～16 分钟低频兜底；失活 120 秒后有限恢复。自动请求至少间隔 5 分钟，与手动查询协调，字段补全与恢复各有预算，重连不绕过预算。完整规则与待真机验证的阈值见 [设备协议与状态模型](docs/设备协议与状态模型.md)。
+自动刷新遵循统一调度：订阅后 5 秒按需补全核心字段；在线字段缺失或标旧持续 30 秒后有限补全；失活 120 秒后有限恢复；每 15～16 分钟周期兜底，快速预算耗尽后仍由兜底继续重试，不会永久停止自动刷新。自动请求至少间隔 5 分钟，与手动查询协调，字段补全与恢复各有快速重试预算。睡眠唤醒或时钟跳变会立即把旧读数标旧、重建云连接并在数秒内强制全量同步，唤醒后不会把过期读数当作当前值展示。完整规则与待真机验证的阈值见 [设备协议与状态模型](docs/设备协议与状态模型.md)。
 
 ```mermaid
 flowchart LR
@@ -152,7 +152,7 @@ flowchart LR
 | 配置环境、找目录、写代码、构建测试 | [开发指南](docs/开发指南.md) |
 | 理解登录、模块关系、多设备与绘制生命周期 | [架构设计](docs/架构设计.md) |
 | 改 MQTT、字段映射、在线状态、时效、机型或 AMS | [设备协议与状态模型](docs/设备协议与状态模型.md) |
-| 查看最新修复 | [v0.7.1 发行说明](docs/releases/v0.7.1.md) |
+| 查看最新修复 | [v0.7.2 发行说明](docs/releases/v0.7.2.md) |
 | 确认测过什么、还缺什么 | [验证状态](docs/验证状态.md) |
 | 在 macOS 上做真机验收 | [macOS 真机验收指南](docs/macOS真机验收指南.md) |
 

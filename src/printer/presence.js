@@ -41,9 +41,10 @@ function createPresence({ now = () => Date.now() } = {}) {
     data.evidence = evidence;
   }
   function schedule(at) {
-    data.nextAutoRequestAt = data.autoAttempts >= 2 ? null : Math.max(at + TELEMETRY_TIMEOUT_MS,
-      lastAutoAt === null ? -Infinity : lastAutoAt + AUTO_RETRY_MS,
-      data.lastRequestAt === null ? -Infinity : data.lastRequestAt + AUTO_RETRY_MS);
+    // 时钟回退防御：未来时戳（回拨越过的旧记录）按当前时间计，避免把下次请求推到遥遥无期。
+    const autoBase = lastAutoAt === null ? -Infinity : Math.min(lastAutoAt, at) + AUTO_RETRY_MS;
+    const requestBase = data.lastRequestAt === null ? -Infinity : Math.min(data.lastRequestAt, at) + AUTO_RETRY_MS;
+    data.nextAutoRequestAt = data.autoAttempts >= 2 ? null : Math.max(at + TELEMETRY_TIMEOUT_MS, autoBase, requestBase);
   }
   return {
     get value() { return { ...data }; },
@@ -92,12 +93,25 @@ function createPresence({ now = () => Date.now() } = {}) {
     },
     tick() {
       const at = now();
-      if (!ready || explicitlyOffline || data.waitingSince === null || at < data.waitingSince) return false;
+      if (!ready || explicitlyOffline || data.waitingSince === null) return false;
+      // 时钟回退防御：等待起点被回拨越过时下修到当前时间，重新计时而不是永久不超时。
+      if (at < data.waitingSince) data.waitingSince = at;
       if (at - data.waitingSince >= TELEMETRY_TIMEOUT_MS) {
         transition("unresponsive", "telemetry-timeout", at);
         return data.autoAttempts < 2 && data.nextAutoRequestAt !== null && at >= data.nextAutoRequestAt;
       }
       return false;
+    },
+    /**
+     * 唤醒/时钟跳变后的盲窗恢复：重置失活快速档预算并重新武装恢复请求时间。
+     * 观测时间戳是事实，不改写；标记与超时仍按原有规则推进。
+     */
+    resume() {
+      const at = now();
+      if (data.waitingSince !== null && data.waitingSince > at) data.waitingSince = at;
+      data.autoAttempts = 0;
+      lastAutoAt = null;
+      if (!explicitlyOffline && ready) schedule(at);
     },
   };
 }

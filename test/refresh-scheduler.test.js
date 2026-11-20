@@ -108,7 +108,7 @@ test("multiple stale fields, including nested AMS measurements, share one refres
   assert.equal(clock.due(), "fields");
   clock.requested();
   clock.advance(15 * MINUTE);
-  assert.equal(clock.due(), null);
+  assert.equal(clock.due(), "periodic", "预算耗尽后由周期兜底接管，不再永久安静");
 });
 
 test("manual and automatic requests both impose the five-minute automatic cooldown", () => {
@@ -142,7 +142,9 @@ test("the same unresolved field batch has at most two automatic attempts", () =>
   const clock = setup();
   exhaustFieldBatch(clock);
   clock.advance(5 * MINUTE);
-  assert.equal(clock.due(), null);
+  assert.equal(clock.due(), null, "快速档预算耗尽后不再提前补全");
+  clock.advance(10 * MINUTE);
+  assert.equal(clock.due(), "periodic", "周期兜底继续覆盖未解决批次");
 });
 
 test("unrelated temperature reports neither restart the thirty-second delay nor reset attempts", () => {
@@ -167,26 +169,35 @@ test("unrelated temperature reports neither restart the thirty-second delay nor 
   assert.equal(clock.due(), null);
 });
 
-test("fifteen-minute periodic polling cannot bypass an exhausted field budget", () => {
+test("periodic floor retries an exhausted batch every fifteen minutes", () => {
   const clock = setup();
   exhaustFieldBatch(clock);
   for (let cycle = 0; cycle < 3; cycle++) {
     clock.advance(15 * MINUTE);
-    assert.equal(clock.due(), null);
+    assert.equal(clock.due(), "periodic", `第 ${cycle + 1} 次周期兜底`);
+    clock.requested();
+    clock.advance(5 * MINUTE);
+    assert.equal(clock.due(), null, "兜底之间仍受共享冷却约束");
+    clock.advance(10 * MINUTE);
   }
 });
 
-test("broker reconnect and repeated online events cannot bypass an exhausted field budget", () => {
+test("broker reconnect re-syncs within the shared cooldown even after the batch budget is spent", () => {
   const clock = setup();
   exhaustFieldBatch(clock);
   clock.advance(5 * MINUTE);
   clock.scheduler.broker(false);
   clock.scheduler.broker(true);
   clock.advance(5_000);
-  assert.equal(clock.due(), null);
+  assert.equal(clock.due(), "sync", "重连后的同步不受批次预算门控");
+  clock.requested();
+  // 重复 online 事件不绕过共享冷却，但会重新武装同步。
   clock.scheduler.onlineEvent();
   clock.advance(5_000);
   assert.equal(clock.due(), null);
+  clock.advance(5 * MINUTE - 5_000);
+  assert.equal(clock.due(), "sync");
+  clock.requested();
 });
 
 test("reconnect cannot bypass the shared cooldown while fields still have an attempt", () => {
@@ -280,6 +291,43 @@ test("periodic refresh includes injected jitter and a manual request restarts it
   assert.equal(clock.due(), "periodic");
 });
 
+test("resume forces an unconditional sync after the grace and clears the shared cooldown", () => {
+  const clock = setup();
+  clock.scheduler.broker(true);
+  clock.advance(5_000);
+  clock.requested(false);
+  clock.advance(60_000);
+  clock.scheduler.resume();
+  clock.advance(4_999);
+  assert.equal(clock.due(), null, "宽限期内不请求");
+  clock.advance(1);
+  assert.equal(clock.due(), "sync", "盲窗后即使没有缺失或标旧字段也强制同步");
+  clock.requested();
+});
+
+test("resume resets the batch attempt budget so exhausted fields retry promptly", () => {
+  const clock = setup();
+  exhaustFieldBatch(clock);
+  clock.scheduler.resume();
+  clock.advance(5_000);
+  assert.equal(clock.due(), "sync");
+  clock.requested();
+  clock.advance(5 * MINUTE);
+  assert.equal(clock.due(), "fields", "预算重置后字段补全恢复快速重试");
+  clock.requested();
+});
+
+test("a backward clock step re-arms timers instead of blocking automatic refresh forever", () => {
+  const clock = setup({ complete: false });
+  clock.scheduler.broker(true);
+  clock.advance(5_000);
+  clock.requested();
+  clock.advance(-5_000);
+  assert.equal(clock.due(ONLINE, true), null, "冷却从回拨时刻重新起算");
+  clock.advance(5 * MINUTE);
+  assert.equal(clock.due(ONLINE, true), "recovery", "冷却结束后自动刷新恢复，而不是永久封锁");
+});
+
 test("disconnected, unsubscribed, explicitly offline, and unknown states never request", () => {
   for (const condition of ["disconnected", "unsubscribed", "offline", "unknown"]) {
     const clock = setup({ complete: false });
@@ -293,21 +341,33 @@ test("disconnected, unsubscribed, explicitly offline, and unknown states never r
   }
 });
 
-test("unresponsive presence only requests recovery, which takes priority over sync and fields", () => {
+test("unresponsive presence keeps sync and the periodic floor as liveness fallbacks", () => {
   const clock = setup({ complete: false });
   clock.scheduler.broker(true);
   clock.advance(30_000);
-  assert.equal(clock.due({ state: "unresponsive" }), null);
-  assert.equal(clock.due({ state: "unresponsive" }, true), "recovery");
-  assert.equal(clock.due(SYNCING, true), "recovery");
+  assert.equal(clock.due({ state: "unresponsive" }, true), "recovery", "失活恢复优先于同步");
+  assert.equal(clock.due(SYNCING, true), "recovery", "恢复原因在其他等待状态下同样优先");
   assert.equal(clock.due(ONLINE, true), "recovery");
+  clock.requested();
+  clock.advance(5 * MINUTE);
+  clock.scheduler.onlineEvent();
+  clock.advance(5_000);
+  assert.equal(clock.due({ state: "unresponsive" }), "sync", "失活不挡死同步");
+  clock.requested();
+  clock.advance(5 * MINUTE);
+  assert.equal(clock.due({ state: "unresponsive" }), null, "字段补全仍只在在线时提前触发");
+  clock.advance(10 * MINUTE);
+  assert.equal(clock.due({ state: "unresponsive" }), "periodic", "失活期间由周期兜底继续重试");
 });
 
-test("syncing presence respects the existing inactivity recovery budget", () => {
+test("synchronization is not gated by the exhausted inactivity budget", () => {
   const clock = setup({ complete: false });
   clock.scheduler.broker(true);
   clock.advance(5_000);
-  assert.equal(clock.due({ state: "syncing", autoAttempts: 2 }), null);
-  clock.advance(30_000);
-  assert.equal(clock.due({ state: "syncing", autoAttempts: 2 }), null);
+  assert.equal(clock.due({ state: "syncing", autoAttempts: 2 }), "sync");
+  clock.requested();
+  clock.advance(5 * MINUTE);
+  clock.scheduler.onlineEvent();
+  clock.advance(5_000);
+  assert.equal(clock.due({ state: "syncing", autoAttempts: 2 }), "sync");
 });

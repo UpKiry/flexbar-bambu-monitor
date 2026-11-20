@@ -31,12 +31,32 @@ function refreshTargets(state) {
   return targets;
 }
 
+/**
+ * 自动完整状态调度（见 docs/设备协议与状态模型.md「presence、超时与有限恢复」）。
+ *
+ * 活性底线：任何预算耗尽都不能永久停止自动刷新。快速档（sync / fields / recovery）
+ * 决定"多快"重试，周期兜底（periodic）保证"总会"再试；明确 offline 才停止查询。
+ * 唤醒/时钟跳变的盲窗由 `resume()` 重置预算与节流，由 manager 决定触发。
+ */
 function createRefreshScheduler({ now = () => Date.now(), random = Math.random } = {}) {
   let ready = false;
   let syncAt = null;
+  let forcedSync = false;
   let lastRequestAt = null;
   let nextPeriodicAt = null;
+  let lastNow = null;
   const pending = new Map();
+
+  // 时钟回退防御：被越过的时戳下修到当前时间，冷却从回拨时刻重新起算。
+  // 大幅回退由 manager 的 tick 跳变检测走完整 resume，这里只防小步回拨死锁。
+  function advanceClock(at) {
+    if (lastNow !== null && at < lastNow) {
+      if (lastRequestAt !== null && lastRequestAt > at) lastRequestAt = at;
+      for (const item of pending.values()) if (item.since > at) item.since = at;
+    }
+    lastNow = at;
+  }
+
   function observe(state) {
     const targets = refreshTargets(state);
     for (const key of pending.keys()) if (!targets.has(key)) pending.delete(key);
@@ -56,31 +76,51 @@ function createRefreshScheduler({ now = () => Date.now(), random = Math.random }
       ready = connected;
     },
     onlineEvent() { if (ready) syncAt ??= now() + SYNC_DELAY_MS; },
-    due(state, presence, recoveryDue) {
-      observe(state);
+    /**
+     * 唤醒/时钟跳变后的盲窗恢复：立即重置节流与快速档预算，
+     * 五秒宽限后强制一次全量同步（不看字段状态，盲窗里错过了什么不可知）。
+     */
+    resume() {
       const at = now();
+      lastNow = at;
+      lastRequestAt = null;
+      syncAt = at + SYNC_DELAY_MS;
+      forcedSync = true;
+      nextPeriodicAt = at + PERIODIC_INTERVAL_MS + Math.floor(random() * 60_000);
+      for (const item of pending.values()) item.attempts = 0;
+    },
+    due(state, presence, recoveryDue) {
+      const at = now();
+      advanceClock(at);
+      observe(state);
       if (!ready || presence.state === "offline" || presence.state === "unknown") return null;
       // A manual request and every automatic reason share the same interval.
-      if (lastRequestAt !== null && (at < lastRequestAt || at - lastRequestAt < AUTO_INTERVAL_MS)) return null;
+      if (lastRequestAt !== null && at - lastRequestAt < AUTO_INTERVAL_MS) return null;
       if (recoveryDue) return "recovery";
-      if (presence.state === "unresponsive") return null;
-      if (syncAt !== null && at < syncAt) return null;
-      const eligible = [...pending.values()].filter(item => item.attempts < 2);
-      if (syncAt !== null && at >= syncAt) {
+      if (syncAt !== null) {
+        if (at < syncAt) return null;
+        const forced = forcedSync;
         syncAt = null;
-        if (eligible.length && (presence.state === "online" || presence.autoAttempts < 2)) return "sync";
+        forcedSync = false;
+        // 盲窗（resume）后强制同步；（重）订阅后的同步由缺失/标旧目标决定。
+        if (forced || refreshTargets(state).size > 0) return "sync";
       }
-      if (presence.state !== "online") return null;
-      if (eligible.some(item => at >= item.since && at - item.since >= FIELD_DELAY_MS)) return "fields";
-      // An unresolved batch must not use periodic polling to evade its retry budget.
-      if (!pending.size && nextPeriodicAt !== null && at >= nextPeriodicAt) return "periodic";
+      if (presence.state === "online") {
+        const eligible = [...pending.values()].filter(item => item.attempts < 2);
+        if (eligible.some(item => at >= item.since && at - item.since >= FIELD_DELAY_MS)) return "fields";
+      }
+      // 活性底线：预算耗尽、失活未恢复也保留周期兜底，不能永久停止自动刷新。
+      if (nextPeriodicAt !== null && at >= nextPeriodicAt) return "periodic";
       return null;
     },
     requested(state, automatic = false) {
+      const at = now();
+      advanceClock(at);
       observe(state);
-      lastRequestAt = now();
+      lastRequestAt = at;
       syncAt = null;
-      nextPeriodicAt = now() + PERIODIC_INTERVAL_MS + Math.floor(random() * 60_000);
+      forcedSync = false;
+      nextPeriodicAt = at + PERIODIC_INTERVAL_MS + Math.floor(random() * 60_000);
       if (automatic) for (const item of pending.values()) item.attempts = Math.min(2, item.attempts + 1);
     },
   };

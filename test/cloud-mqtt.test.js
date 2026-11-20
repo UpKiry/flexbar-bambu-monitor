@@ -229,6 +229,60 @@ test("unconfirmed MQTT close times out and does not restart", async () => {
   assert.equal(client.state, CONNECTION_STATES.failed);
 });
 
+test("recycle rebuilds the connection immediately without backoff", async () => {
+  const { client, created } = makeClient();
+  client.start();
+  const first = created[0];
+  first.emit("connect");
+  assert.equal(client.state, CONNECTION_STATES.connected);
+  assert.equal(client.recycle(), true);
+  assert.equal(first.ended, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2, "关闭确认后立即重建连接，不走退避");
+  assert.equal(client.state, CONNECTION_STATES.connecting);
+  await client.stop();
+});
+
+test("recycle while a close is pending reconnects only once", async () => {
+  const { client, created } = makeClient();
+  client.start();
+  const first = created[0];
+  first.emit("connect");
+  let done;
+  first.end = (_force, callback) => { done = callback; };
+  assert.equal(client.recycle(), true);
+  assert.equal(client.recycle(), true);
+  assert.equal(created.length, 1);
+  done();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2);
+  await client.stop();
+});
+
+test("recycle during a backoff reconnects at once instead of waiting for the timer", async () => {
+  const { client, created } = makeClient();
+  client.start();
+  created[0].emit("connect");
+  created[0].emit("close");
+  assert.equal(client.state, CONNECTION_STATES.reconnecting);
+  assert.equal(client.recycle(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(created.length, 2);
+  await client.stop();
+});
+
+test("recycle is refused after an authorization failure", async () => {
+  const { client, created } = makeClient();
+  client.start();
+  const fake = created[0];
+  fake.emit("connect");
+  fake.emit("error", { code: 5 });
+  assert.equal(client.state, CONNECTION_STATES.failed);
+  assert.equal(client.recycle(), false);
+  assert.equal(created.length, 1);
+  await client.stop();
+});
+
 test("pushall requests enforce a five-second per-device cooldown", () => {
   let monotonic = 50;
   const { client, created } = makeClient({ deviceId: "COOLDOWN-5S", cooldownNow: () => monotonic });

@@ -240,7 +240,7 @@ test("presence tracks valid messages separately, preserves measurements and boun
   let at = 0;
   let requests = 0;
   const { factory, created } = makeFakeMqttFactory();
-  const manager = createPrinterManager({ now: () => at, createMqttClient: (options) => {
+  const manager = createPrinterManager({ now: () => at, resumeGapMs: Infinity, createMqttClient: (options) => {
     const fake = factory(options);
     let presenceHandler;
     fake.onPresence = (handler) => { presenceHandler = handler; };
@@ -268,7 +268,7 @@ test("presence tracks valid messages separately, preserves measurements and boun
   connected();
   at += 1000000;
   manager.tick();
-  assert.equal(requests, 2);
+  assert.equal(requests, 3, "重连盲窗后的同步不受旧预算门控，也不重置失活预算");
   const changes = [];
   manager.subscribe((change) => changes.push({ ...change, observedNozzle: manager.state.nozzle.current }));
   fake.emitReport({ raw: { nozzle_temper: 0, gcode_state: "RUNNING" }, receivedAt: at });
@@ -291,7 +291,7 @@ test("presence tracks valid messages separately, preserves measurements and boun
   assert.equal(manager.presence.lastTelemetryAt, at - 1);
   at += 1000000;
   manager.tick();
-  assert.equal(requests, 3);
+  assert.equal(requests, 4, "明确离线后 tick 不再自动查询，计数停留在离线前的请求");
   assert.equal(manager.state.activity, "printing");
   assert.equal(manager.state.nozzle.current, 0);
   fake.emitStatus({ state: "reconnecting", subscribed: false });
@@ -311,7 +311,7 @@ function refreshSetup() {
   const { factory, created } = makeFakeMqttFactory();
   const requests = [];
   let result = { sent: true };
-  const manager = createPrinterManager({ now: () => at, createMqttClient: (options) => {
+  const manager = createPrinterManager({ now: () => at, resumeGapMs: Infinity, createMqttClient: (options) => {
     const fake = factory(options);
     fake.requestFullState = (request) => { requests.push({ at, ...request }); return result; };
     return fake;
@@ -327,7 +327,7 @@ function refreshSetup() {
 
 const CORE_REPORT = { gcode_state: "IDLE", nozzle_temper: 20, bed_temper: 20 };
 
-test("reconnect fills stale fans despite continuous temperatures and bounds failed attempts", () => {
+test("reconnect fills stale fans and re-syncs within the shared cooldown after failed attempts", () => {
   const f = refreshSetup();
   f.report({ ...CORE_REPORT, cooling_fan_speed: 0 });
   f.status(false);
@@ -345,7 +345,7 @@ test("reconnect fills stale fans despite continuous temperatures and bounds fail
   f.time(305000);
   f.manager.tick();
   assert.equal(f.requests[1].reason, "fields");
-  // Other live telemetry and broker reconnects cannot renew this field budget.
+  // 批次快速档只有两次；之后由重连同步与周期兜底接管，而不是永久安静。
   for (const at of [610000, 2000000]) {
     f.time(at);
     f.status(false);
@@ -353,20 +353,21 @@ test("reconnect fills stale fans despite continuous temperatures and bounds fail
     f.report(CORE_REPORT);
     f.time(at + 5000);
     f.manager.tick();
+    assert.equal(f.requests.at(-1).reason, "sync", "重连盲窗后重新同步");
   }
-  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests.length, 4);
   f.report({ cooling_fan_speed: 0 });
   assert.equal(f.manager.state.freshness.fields["fans.part"].stale, false);
-  f.time(2010000);
+  f.time(2310000);
   f.status(false);
   f.status(true);
   f.report(CORE_REPORT);
-  f.time(2015000);
+  f.time(2315000);
   f.manager.tick();
-  assert.equal(f.requests.length, 3);
+  assert.equal(f.requests.length, 5, "字段重报释放预算后，新的标旧情况仍会补全");
 });
 
-test("startup requests share the silence recovery budget across reconnect", () => {
+test("reconnect re-syncs but the silence recovery budget stays shared across reconnects", () => {
   const f = refreshSetup();
   f.time(4999);
   f.manager.tick();
@@ -382,7 +383,14 @@ test("startup requests share the silence recovery budget across reconnect", () =
   f.status(true);
   f.time(2000000);
   f.manager.tick();
-  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests[2].reason, "sync", "重连同步不受失活预算门控");
+  // 失活恢复快速档仍然只有两次，重连与同步都不重置；之后由周期兜底覆盖。
+  f.time(2300000);
+  f.manager.tick();
+  assert.equal(f.requests.length, 3);
+  f.time(2960000);
+  f.manager.tick();
+  assert.equal(f.requests[3].reason, "periodic");
 });
 
 test("natural core reports cancel startup sync and manual refresh delays periodic polling", () => {
@@ -402,6 +410,71 @@ test("natural core reports cancel startup sync and manual refresh delays periodi
   f.report(CORE_REPORT);
   f.manager.tick();
   assert.equal(f.requests[1].reason, "periodic");
+});
+
+function wakeSetup() {
+  let at = 0;
+  const { factory, created } = makeFakeMqttFactory();
+  const requests = [];
+  const manager = createPrinterManager({ now: () => at, createMqttClient: (options) => {
+    const fake = factory(options);
+    fake.requestFullState = (request) => { requests.push({ at, ...request }); return { sent: true }; };
+    fake.recycle = () => { fake.recycled = (fake.recycled || 0) + 1; return true; };
+    return fake;
+  } });
+  manager.selectPrinter("WAKE");
+  manager.connect({ host: "h", userId: "1", accessToken: "t" });
+  const fake = created[0];
+  fake.emitStatus({ state: "connected", subscribed: true });
+  fake.emitReport({ raw: { gcode_state: "RUNNING", nozzle_temper: 21, bed_temper: 60 }, receivedAt: at });
+  const status = (connected) => fake.emitStatus({ state: connected ? "connected" : "reconnecting", subscribed: connected });
+  return { manager, requests, fake, status, time(value) { at = value; } };
+}
+
+test("wake gap marks observations stale, recycles the connection and forces a full sync", () => {
+  const w = wakeSetup();
+  w.time(1_000);
+  w.manager.tick();
+  assert.equal(w.requests.length, 0);
+  w.time(30_000);
+  w.manager.requestFullState();
+  assert.equal(w.requests.length, 1, "睡眠前的手动请求压住自动冷却");
+  w.time(90_000);
+  w.manager.tick();
+  assert.equal(w.fake.recycled, 1);
+  assert.equal(w.manager.state.freshness.fields["nozzle.current"].stale, true, "盲窗旧读数立即标旧");
+  assert.equal(w.requests.length, 1, "宽限期内不请求");
+  w.status(false);
+  w.status(true);
+  w.time(95_000);
+  w.manager.tick();
+  assert.equal(w.requests.length, 2);
+  assert.equal(w.requests[1].reason, "sync");
+  assert.equal(w.requests[1].automatic, true);
+  assert.equal(w.requests[1].at, 95_000, "唤醒重置共享冷却，立即同步而不是等满五分钟");
+});
+
+test("small tick gaps do not trigger wake recovery", () => {
+  const w = wakeSetup();
+  w.time(1_000);
+  w.manager.tick();
+  w.time(20_000);
+  w.manager.tick();
+  assert.equal(w.fake.recycled, undefined);
+  assert.equal(w.manager.state.freshness.fields["nozzle.current"].stale, false);
+  assert.equal(w.requests.length, 0);
+});
+
+test("a large backward clock jump is treated as a blind window like wake", () => {
+  const w = wakeSetup();
+  w.time(60_000);
+  w.manager.tick();
+  assert.equal(w.fake.recycled, undefined, "首次 tick 不检测跳变");
+  assert.equal(w.manager.state.freshness.fields["nozzle.current"].stale, false);
+  w.time(1_000);
+  w.manager.tick();
+  assert.equal(w.fake.recycled, 1, "大幅回拨按盲窗处理");
+  assert.equal(w.manager.state.freshness.fields["nozzle.current"].stale, true);
 });
 
 test("unconfirmed close prevents any replacement", async () => {

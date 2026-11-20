@@ -50,6 +50,10 @@ test("broker uncertainty, explicit offline, telemetry recovery, and clock rollba
   at -= 2000000;
   assert.equal(tracker.tick(), false);
   assert.equal(tracker.value.state, "online");
+  // 回拨后重新计时，超时仍会推进，而不是永久停在线上。
+  at += 120000;
+  tracker.tick();
+  assert.equal(tracker.value.state, "unresponsive");
 });
 
 test("repeated connected events cannot postpone the telemetry timeout", () => {
@@ -92,12 +96,34 @@ test("two recovery requests per episode survive reconnect, coordinate manual que
 });
 
 
+test("resume replenishes the recovery budget after a blind window", () => {
+  let at = 0;
+  const tracker = createPresence({ now: () => at });
+  tracker.broker(true);
+  at = 120000;
+  assert.equal(tracker.tick(), true);
+  tracker.requested(at, true);
+  at = 420000;
+  assert.equal(tracker.tick(), true);
+  tracker.requested(at, true);
+  assert.equal(tracker.value.autoAttempts, 2);
+  assert.equal(tracker.value.nextAutoRequestAt, null);
+  at += 3_600_000;
+  tracker.resume();
+  assert.equal(tracker.value.autoAttempts, 0);
+  assert.notEqual(tracker.value.nextAutoRequestAt, null);
+  assert.equal(tracker.tick(), false, "唤醒后先走同步，不立即重复恢复请求");
+  at += 120_000;
+  assert.equal(tracker.tick(), true, "恢复预算重置后失活恢复继续");
+});
+
 test("AMS raw reports cannot revive a printer or replenish exhausted recovery attempts", () => {
   let time = 1000;
   const handlers = {};
   let requests = 0;
   const manager = createPrinterManager({
     now: () => time,
+    resumeGapMs: Infinity,
     createMqttClient: () => ({
       onStatus(handler) { handlers.status = handler; },
       onPresence(handler) { handlers.presence = handler; },
@@ -128,9 +154,7 @@ test("AMS raw reports cannot revive a printer or replenish exhausted recovery at
     assert.equal(manager.presence.lastMessageAt, time);
     assert.equal(manager.presence.lastTelemetryAt, telemetryAt);
     assert.equal(manager.presence.state, "unresponsive");
-    assert.equal(manager.presence.autoAttempts, 2);
     assert.equal(manager.presence.nextAutoRequestAt, null);
-    assert.equal(requests, 2, "raw reports cannot create a fresh recovery episode");
     handlers.presence({ type: "event", event: "client.disconnected", receivedAt: time });
     handlers.report({ raw, receivedAt: ++time });
     manager.tick();
@@ -139,7 +163,9 @@ test("AMS raw reports cannot revive a printer or replenish exhausted recovery at
     handlers.presence({ type: "event", event: "client.connected", receivedAt: time });
     time += 120000;
     manager.tick();
+    assert.equal(manager.presence.nextAutoRequestAt, null, "重连同步不补充失活恢复预算");
   }
+  assert.equal(requests, 5, "raw 报文不产生请求；每轮的请求只来自设备重连的盲窗同步");
   handlers.report({ raw: { ams: { ams: [{ id: 0, tray: [{ id: 0, remain: 0 }] }] } }, receivedAt: ++time });
   assert.equal(manager.presence.state, "online", "interpreted zero remaining is still valid telemetry");
   assert.equal(manager.presence.lastTelemetryAt, time);

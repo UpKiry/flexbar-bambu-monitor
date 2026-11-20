@@ -377,6 +377,31 @@ function createCloudMqttClient({
       return closed || Promise.resolve();
     },
     /**
+     * 立即重建连接（系统唤醒、时钟跳变后的盲窗恢复）。
+     *
+     * 休眠期间 TCP 可能已静默死亡而状态仍显示 connected；与其把请求发进
+     * 死连接，不如主动重建。等待旧连接关闭后立刻 connect，不走退避；
+     * 认证失败（stopped）时不重建。
+     */
+    recycle() {
+      if (stopped) return false;
+      clearReconnectTimer();
+      attempt = 0;
+      const pending = teardownClient();
+      const restart = () => {
+        if (!stopped) connect();
+      };
+      if (pending) {
+        pending.then(restart, () => {
+          if (!stopped) {
+            lastError = { kind: "network", message: "无法确认旧连接已关闭" };
+            setState(CONNECTION_STATES.failed);
+          }
+        });
+      } else restart();
+      return true;
+    },
+    /**
      * 主动请求完整状态。
      *
      * 这是只读状态查询，不包含打印控制命令；同一设备至少间隔 5 秒。

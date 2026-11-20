@@ -17,6 +17,7 @@ function deepFreeze(value) {
  * 职责：
  * - 管理"当前选中的打印机"，为多设备扩展预留结构；
  * - 持有云 MQTT 连接，并把报文合并进统一状态模型；
+ * - tick 间隔跳变（休眠唤醒、时钟跳变）时执行盲窗恢复：标旧、重置刷新预算并重建连接；
  * - 不在此处做绘制，也不读配置：状态变化通过回调通知上层。
  *
  * 发布契约：
@@ -31,6 +32,7 @@ function createPrinterManager({
   onFrame,
   now = () => Date.now(),
   closeTimeoutMs = 6_000,
+  resumeGapMs = 30_000,
 } = {}) {
   let client = null;
   let generation = 0;
@@ -40,6 +42,7 @@ function createPrinterManager({
   let state = deepFreeze(resetForPrinter(null));
   let presenceTracker = createPresence({ now });
   let refreshScheduler = createRefreshScheduler({ now });
+  let lastTickAt = null;
 
   let lastNotifiedPresence = presenceTracker.value;
   function notifyPresence() {
@@ -54,7 +57,27 @@ function createPrinterManager({
     publishState({ ...reduceConnection(state, "disconnected"), connection });
   }
 
+  /**
+   * 盲窗恢复（系统休眠唤醒、时钟跳变）：tick 间隔跳变是进程内唯一可靠的唤醒信号。
+   * 睡眠期间定时器停摆、TCP 可能静默死亡，旧读数立即标旧，请求预算与节流重置，
+   * 云连接主动重建，避免把请求发进死连接、把唤醒前的旧值当作当前值。
+   */
+  function handleResume() {
+    markObservationsStale();
+    refreshScheduler.resume();
+    presenceTracker.resume();
+    try {
+      client?.recycle?.();
+    } catch {
+      logger?.warn?.("重建云连接失败");
+    }
+    logger?.info?.("检测到系统唤醒或时钟跳变，已标旧并重建云连接");
+  }
+
   function tick() {
+    const at = now();
+    if (lastTickAt !== null && Math.abs(at - lastTickAt) >= resumeGapMs) handleResume();
+    lastTickAt = at;
     const previousState = presenceTracker.value.state;
     const recoveryDue = presenceTracker.tick();
     if (previousState !== "unresponsive" && presenceTracker.value.state === "unresponsive") markObservationsStale();
